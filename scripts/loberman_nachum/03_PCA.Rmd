@@ -1,0 +1,461 @@
+---
+title: "Análisis de Componentes Principales (PCA) — Loberman-Nachum et al. (2019)"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+date: "2026-06-30"
+---
+
+Este script realiza el análisis exploratorio no supervisado de los datos de expresión génica mediante PCA. A diferencia de los papers anteriores, aquí no hay múltiples matrices ómicas ni múltiples puntos de tiempo: hay una única matriz de expresión con 54 muestras y aproximadamente 14.300 genes. El PCA permite visualizar la estructura global de los datos, detectar si celiaquía y controles se separan de forma natural en el espacio de componentes, e identificar posibles fuentes de variabilidad técnica o clínica que puedan confundir los análisis posteriores.
+
+# Carga de librerías y datos
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(PLSandO)
+library(knitr)
+library(ggplot2)
+library(here)
+processed_dir <- here("data", "processed", "loberman_nachum")
+
+metadata                 <- readRDS(file.path(processed_dir, "metadata.rds"))
+expression_log_data      <- readRDS(file.path(processed_dir, "expression_log_data.rds"))
+gene_annotation_filtered <- readRDS(file.path(processed_dir, "gene_annotation_filtered.rds"))
+gene_label_map           <- readRDS(file.path(processed_dir, "gene_label_map.rds"))
+
+dim(metadata)
+dim(expression_log_data)
+dim(gene_annotation_filtered)
+```
+
+Se comprueba que el orden de las muestras en `metadata` coincide exactamente con el de `expression_log_data`, ya que los `colBy` de los score plots más adelante usan `metadata` directamente en vez de derivarlo de `expression_log_data`. Si esta comprobación fallara, los colores de los score plots quedarían mal asignados sin ningún aviso.
+
+```{r}
+stopifnot(identical(metadata$sample_id, expression_log_data$sample_id))
+```
+
+# Preparación de la matriz de expresión
+
+Se separan las columnas de metadatos de las columnas génicas y se construye la matriz numérica X con muestras en filas y genes en columnas. Se verifica que no hay valores faltantes.
+
+```{r}
+metadata_cols <- c(
+  "sample_id", "sample_title", "diagnosis", "group", "cohort",
+  "age", "gender", "ttg_abnormal", "ttg_over100", "abdominal_pain", "location"
+)
+
+metadata_cols <- metadata_cols[metadata_cols %in% colnames(expression_log_data)]
+gene_cols     <- setdiff(colnames(expression_log_data), metadata_cols)
+
+X <- expression_log_data %>%
+  dplyr::select(all_of(gene_cols)) %>%
+  mutate(across(everything(), as.numeric)) %>%
+  as.data.frame(check.names = FALSE)
+
+rownames(X) <- expression_log_data$sample_id
+
+dim(X)
+sum(is.na(X))
+```
+
+**Nota importante**: Aunque el código no llame a `make.names()` explícitamente. Se comprobó: `identical(colnames(X), rownames(pca_center$loadings))` daba `FALSE`, con 108 genes afectados (los mismos de siempre: locus `HLA-*`, histonas `H1-*`/`H3-*`, etc.).
+
+Para poder recuperar la anotación génica sin ambigüedad en los loadings y en las tablas de contribución de anómalos, se aplica `make.names()` de forma explícita y controlada sobre `X` **antes** de llamar a `pca()`, guardando una tabla de traducción inversa (`safe_name_lookup`).
+
+```{r}
+safe_gene_names <- make.names(colnames(X))
+
+cat("Genes cuyo nombre cambia al sanear:", sum(safe_gene_names != colnames(X)), "\n")
+
+safe_name_lookup <- tibble(
+  safe_name  = safe_gene_names,
+  gene_label = colnames(X)
+)
+
+stopifnot(sum(duplicated(safe_gene_names)) == 0)
+
+colnames(X) <- safe_gene_names
+```
+
+---
+
+# PCA — Escalado centrado
+
+## Cálculo y scree plot
+
+```{r}
+pca_center <- pca(X, ncomp = NULL, algo = "nipals", scaling = "center")
+pcaPlot(pca_center, type = "scree") 
+```
+
+## Score plots
+
+### Diagnóstico
+
+```{r}
+pcaPlot(pca_center, type = "scores", comp = c(1, 2),
+        colBy = metadata$group, ellipses = FALSE, labels = FALSE)
+```
+
+### Cohorte (training / validation)
+
+```{r}
+pcaPlot(pca_center, type = "scores", comp = c(1, 2),
+        colBy = metadata$cohort, ellipses = FALSE, labels = FALSE)
+```
+
+### Sexo
+
+```{r}
+pcaPlot(pca_center, type = "scores", comp = c(1, 2),
+        colBy = metadata$gender, ellipses = FALSE, labels = FALSE)
+```
+
+### TTG anormal
+
+```{r}
+pcaPlot(pca_center, type = "scores", comp = c(1, 2),
+        colBy = metadata$ttg_abnormal, ellipses = FALSE, labels = FALSE)
+```
+
+### Dolor abdominal
+
+```{r}
+pcaPlot(pca_center, type = "scores", comp = c(1, 2),
+        colBy = metadata$abdominal_pain, ellipses = FALSE, labels = FALSE)
+```
+
+## Loadings — Correlation plot
+
+```{r}
+pcaPlot(pca_center, type = "corr", comp = c(1, 2),
+        colBy = "contrib", shape = "point", labels = FALSE, col = "hot")
+```
+
+## Loadings — Top 15 genes
+
+Los nombres de columna de `X` están saneados (`make.names()`) antes de pasar a `pca()`. Se revierte primero al `gene_label` real mediante `safe_name_lookup`, y después se recupera el `GeneID` original y la `Description` a través de `gene_label_map`.
+
+```{r}
+loadings_center <- as.data.frame(pca_center$loadings) %>%
+  rownames_to_column("safe_name") %>%
+  as_tibble()
+
+colnames(loadings_center)[-1] <- paste0("PC", seq_len(ncol(loadings_center) - 1))
+
+loadings_center <- loadings_center %>%
+  left_join(safe_name_lookup, by = "safe_name") %>%
+  left_join(gene_label_map, by = "gene_label") %>%
+  left_join(
+    gene_annotation_filtered %>%
+      mutate(GeneID = as.character(GeneID)) %>%
+      dplyr::select(GeneID, Description),
+    by = "GeneID"
+  )
+
+loadings_center %>%
+  dplyr::select(gene_label, GeneID, Description, PC1, PC2) %>%
+  pivot_longer(cols = starts_with("PC"), names_to = "PC", values_to = "loading") %>%
+  mutate(abs_loading = abs(loading)) %>%
+  group_by(PC) %>%
+  arrange(desc(abs_loading), .by_group = TRUE) %>%
+  slice_head(n = 15) %>%
+  ungroup() %>%
+  dplyr::select(PC, gene_label, GeneID, Description, loading, abs_loading) %>%
+  kable(caption = "Top 15 genes con mayor contribución — PCA centrado")
+```
+
+
+# Detección de muestras anómalas
+
+Se fija el número de componentes a K=2 ya que, con estas dos componentes los datos se separan bien entre grupos. Se detectan anómalos mediante dos criterios complementarios: RSS (Residual Sum of Squares) y T² de Hotelling.
+
+```{r}
+K <- 2
+pca_center <- pca(X, ncomp = K, algo = "nipals", scaling = "center")
+```
+
+```{r fig.width=10, fig.height=4}
+par(mfrow = c(1, 2))
+
+pca_cen_out_RSS <- pcaOutliers(pca_center, ncomp = pca_center$ncomp,method = "RSS", conf = 0.95)
+pca_cen_out_T2  <- pcaOutliers(pca_center, ncomp = pca_center$ncomp,method = "T2",  conf = 0.95)
+
+par(mfrow = c(1, 1))
+```
+
+```{r}
+pca_cen_moderate <- sort(
+  pca_cen_out_RSS$RSS[pca_cen_out_RSS$ModerateOutliers],
+  decreasing = TRUE
+)
+
+pca_cen_severe <- sort(
+  pca_cen_out_T2$T2[pca_cen_out_T2$SevereOutliers],
+  decreasing = TRUE
+)
+
+cat("Anómalos moderados (RSS) al 95 :\n"); print(pca_cen_moderate)
+cat("\nAnómalos severos (T²) al 95 :\n");   print(pca_cen_severe)
+```
+
+```{r}
+par(mfrow = c(1, 2))
+
+pca_cen_out_RSS_99 <- pcaOutliers(pca_center, ncomp = pca_center$ncomp,method = "RSS", conf = 0.99)
+pca_cen_out_T2_99  <- pcaOutliers(pca_center, ncomp = pca_center$ncomp,method = "T2",  conf = 0.99)
+
+par(mfrow = c(1, 1))
+```
+
+
+```{r}
+cen_moderate_99 <- sort(pca_cen_out_RSS_99$RSS[pca_cen_out_RSS_99$ModerateOutliers],
+                    decreasing = TRUE)
+cen_severe_99   <- sort(pca_cen_out_T2_99$T2[pca_cen_out_T2_99$SevereOutliers],
+                    decreasing = TRUE)
+
+cat("Moderados (RSS) al 99 :\n"); print(cen_moderate_99)
+cat("Severos   (T²) al 99 :\n");  print(cen_severe_99)
+```
+
+```{r}
+pca_cen_mod_contrib_99 <- outlierContrib(pca_center, pca_cen_out_RSS_99)
+```
+
+
+```{r}
+pca_cen_sev_contrib_99 <- outlierContrib(pca_center, pca_cen_out_T2_99)
+```
+
+
+```{r}
+get_top_contrib_list <- function(contrib_matrix, lookup, n = 10) {
+  lapply(rownames(contrib_matrix), function(sample_name) {
+    row <- contrib_matrix[sample_name, ]
+    top <- row[order(abs(row), decreasing = TRUE)][1:n]
+    tibble(
+      sample_id = sample_name,
+      safe_name = names(top),
+      contribution = as.numeric(top)
+    ) %>%
+      left_join(lookup, by = "safe_name") %>%
+      dplyr::select(sample_id, gene_label, contribution)
+  })
+}
+
+top10_cen_moderate <- get_top_contrib_list(pca_cen_mod_contrib_99$contribRSS, safe_name_lookup)
+
+top10_cen_moderate
+```
+
+```{r}
+top10_cen_severe <- get_top_contrib_list(pca_cen_sev_contrib_99$contribT2, safe_name_lookup)
+
+top10_cen_severe
+```
+---
+
+# PCA — Escalado estándar
+
+Se prioriza el escalado estándar para los análisis posteriores (detección de anómalos): en RNA-seq log-transformado la varianza no es homogénea entre genes, y sin escalar, los genes muy expresados dominarían las primeras componentes independientemente de su relevancia biológica.
+
+## Cálculo y scree plot
+
+```{r}
+pca_std <- pca(X, ncomp = NULL, algo = "nipals", scaling = "standard")
+pcaPlot(pca_std, type = "scree") +
+  ggtitle("Genes - Varianza explicada por componente (escalado estándar)")
+```
+
+## Score plots
+
+### Diagnóstico
+
+```{r}
+pcaPlot(pca_std, type = "scores", comp = c(1, 2),
+        colBy = metadata$group, ellipses = FALSE, labels = FALSE) + 
+  ggtitle("Score Plot coloreado según Grupo")
+```
+
+### Cohorte (training / validation)
+
+```{r}
+pcaPlot(pca_std, type = "scores", comp = c(1, 2),
+        colBy = metadata$cohort, ellipses = FALSE, labels = FALSE)
+```
+
+### Sexo
+
+```{r}
+pcaPlot(pca_std, type = "scores", comp = c(1, 2),
+        colBy = metadata$gender, ellipses = FALSE, labels = FALSE)
+```
+
+### TTG anormal
+
+```{r}
+pcaPlot(pca_std, type = "scores", comp = c(1, 2),
+        colBy = metadata$ttg_abnormal, ellipses = FALSE, labels = FALSE)
+```
+
+### Dolor abdominal
+
+```{r}
+pcaPlot(pca_std, type = "scores", comp = c(1, 2),
+        colBy = metadata$abdominal_pain, ellipses = FALSE, labels = FALSE)
+```
+
+## Score plots — PC3-PC4
+
+```{r}
+pcaPlot(pca_std, type = "scores", comp = c(3, 4),
+        colBy = metadata$group, ellipses = FALSE, labels = FALSE)
+
+pcaPlot(pca_std, type = "scores", comp = c(3, 4),
+        colBy = metadata$cohort, ellipses = FALSE, labels = FALSE)
+```
+
+## Score plots — PC5-PC6
+
+```{r}
+pcaPlot(pca_std, type = "scores", comp = c(5, 6),
+        colBy = metadata$group, ellipses = FALSE, labels = FALSE)
+
+pcaPlot(pca_std, type = "scores", comp = c(5, 6),
+        colBy = metadata$cohort, ellipses = FALSE, labels = FALSE)
+```
+
+
+
+## Loadings — Correlation plot
+
+```{r}
+pcaPlot(pca_std, type = "corr", comp = c(1, 2),
+        colBy = "contrib", shape = "point", labels = FALSE, col = "hot")
+```
+
+## Loadings — Top 15 genes
+
+```{r}
+loadings_std <- as.data.frame(pca_std$loadings) %>%
+  rownames_to_column("safe_name") %>%
+  as_tibble()
+
+colnames(loadings_std)[-1] <- paste0("PC", seq_len(ncol(loadings_std) - 1))
+
+loadings_std <- loadings_std %>%
+  left_join(safe_name_lookup, by = "safe_name") %>%
+  left_join(gene_label_map, by = "gene_label") %>%
+  left_join(
+    gene_annotation_filtered %>%
+      mutate(GeneID = as.character(GeneID)) %>%
+      dplyr::select(GeneID, Description),
+    by = "GeneID"
+  )
+
+loadings_std %>%
+  dplyr::select(gene_label, GeneID, Description, PC1, PC2) %>%
+  pivot_longer(cols = starts_with("PC"), names_to = "PC", values_to = "loading") %>%
+  mutate(abs_loading = abs(loading)) %>%
+  group_by(PC) %>%
+  arrange(desc(abs_loading), .by_group = TRUE) %>%
+  slice_head(n = 15) %>%
+  ungroup() %>%
+  dplyr::select(PC, gene_label, GeneID, Description, loading, abs_loading) %>%
+  kable(caption = "Top 15 genes con mayor contribución — PCA estándar")
+```
+
+---
+
+# Detección de muestras anómalas
+
+Se fija el número de componentes a K=2, ya que con estas dos componentes los datos se separan bien entre grupos. Se detectan anómalos mediante dos criterios complementarios: RSS (Residual Sum of Squares) y T² de Hotelling.
+
+```{r}
+K <- 2
+pca_std <- pca(X, ncomp = K, algo = "nipals", scaling = "standard")
+```
+
+```{r fig.width=10, fig.height=4}
+par(mfrow = c(1, 2))
+
+pca_out_RSS <- pcaOutliers(pca_std, ncomp = pca_std$ncomp,method = "RSS", conf = 0.95)
+pca_out_T2  <- pcaOutliers(pca_std, ncomp = pca_std$ncomp,method = "T2",  conf = 0.95)
+
+par(mfrow = c(1, 1))
+```
+
+```{r}
+pca_moderate <- sort(
+  pca_out_RSS$RSS[pca_out_RSS$ModerateOutliers],
+  decreasing = TRUE
+)
+
+pca_severe <- sort(
+  pca_out_T2$T2[pca_out_T2$SevereOutliers],
+  decreasing = TRUE
+)
+
+cat("Anómalos moderados (RSS) al 95 :\n"); print(pca_moderate)
+cat("\nAnómalos severos (T²) al 95 :\n");   print(pca_severe)
+```
+
+```{r}
+par(mfrow = c(1, 2))
+
+pca_out_RSS_99 <- pcaOutliers(pca_std, ncomp = pca_std$ncomp,method = "RSS", conf = 0.99)
+pca_out_T2_99  <- pcaOutliers(pca_std, ncomp = pca_std$ncomp,method = "T2",  conf = 0.99)
+
+par(mfrow = c(1, 1))
+```
+
+
+```{r}
+moderate_99 <- sort(pca_out_RSS_99$RSS[pca_out_RSS_99$ModerateOutliers],
+                    decreasing = TRUE)
+severe_99   <- sort(pca_out_T2_99$T2[pca_out_T2_99$SevereOutliers],
+                    decreasing = TRUE)
+
+cat("Moderados (RSS) al 99 :\n"); print(moderate_99)
+cat("Severos   (T²) al 99 :\n");  print(severe_99)
+```
+
+```{r}
+pca_mod_contrib_99 <- outlierContrib(pca_std, pca_out_RSS_99)
+```
+
+
+```{r}
+pca_sev_contrib_99 <- outlierContrib(pca_std, pca_out_T2_99)
+```
+
+
+```{r}
+get_top_contrib_list <- function(contrib_matrix, lookup, n = 10) {
+  lapply(rownames(contrib_matrix), function(sample_name) {
+    row <- contrib_matrix[sample_name, ]
+    top <- row[order(abs(row), decreasing = TRUE)][1:n]
+    tibble(
+      sample_id = sample_name,
+      safe_name = names(top),
+      contribution = as.numeric(top)
+    ) %>%
+      left_join(lookup, by = "safe_name") %>%
+      dplyr::select(sample_id, gene_label, contribution)
+  })
+}
+
+top10_moderate <- get_top_contrib_list(pca_mod_contrib_99$contribRSS, safe_name_lookup)
+
+top10_moderate
+```
+
+```{r}
+top10_severe <- get_top_contrib_list(pca_sev_contrib_99$contribT2, safe_name_lookup)
+
+top10_severe
+```
+

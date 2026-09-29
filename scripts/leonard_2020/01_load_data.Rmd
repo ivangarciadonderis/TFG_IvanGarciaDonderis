@@ -1,0 +1,187 @@
+---
+title: "Carga de datos — Leonard et al. (2020)"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+date: "2026-06-29"
+---
+
+Este script constituye el primer paso del análisis del paper Leonard et al. (Microbiome, 2020). Su objetivo es leer los archivos suplementarios del estudio, construir las estructuras de datos necesarias y guardarlas procesadas para su uso en scripts posteriores.
+
+Se trabaja con cuatro fuentes de datos: metadatos demográficos (MOESM1), abundancias de especies bacterianas (MOESM2), abundancias de rutas funcionales KEGG (MOESM4) y perfiles metabolómicos (MOESM5).
+
+# Carga de librerías
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(readxl)
+library(here)
+
+data_dir <- here("data", "raw", "leonard_2020")
+
+file_meta     <- file.path(data_dir, "40168_2020_906_MOESM1_ESM.xlsx")
+file_species  <- file.path(data_dir, "40168_2020_906_MOESM2_ESM.xlsx")
+file_pathways <- file.path(data_dir, "40168_2020_906_MOESM4_ESM.xlsx")
+file_metab    <- file.path(data_dir, "40168_2020_906_MOESM5_ESM.xlsx")
+```
+
+# Metadatos de sujetos
+
+Se cargan los metadatos demográficos de los 31 sujetos del estudio. Se seleccionan las columnas relevantes para el análisis y se renombran las columnas de disponibilidad de muestra para evitar espacios en los nombres.
+
+El paso más importante de este bloque es la creación de `Genetic_Risk_Group`, que agrupa los ocho genotipos HLA presentes en los datos en tres categorías clínicamente significativas, tal como define el paper:
+
+- **Negative:** sin predisposición genética a la celiaquía (referencia del modelo)
+- **Standard:** heterocigotos DQ2 o DQ8, o portadores de ambos
+- **High:** homocigotos DQ2, que tienen doble dosis del alelo de riesgo y por tanto mayor predisposición
+
+```{r}
+metadata <- read_excel(file_meta, sheet = "Demographic Metadata") %>%
+  select(
+    PaperID,
+    country,
+    Delivery_Mode,
+    Gender,
+    Genetic_Risk,
+    Feeding_Type,
+    Maternal_antibiotics_during_Delivery,
+    Infant_antibiotics_at_Birth,
+    Infant_antibiotics_before_6mo,
+    Antibiotics_Exposure_at_Birth,
+    Exposure_to_Environmental_Factors,
+    Enrollment_Sample       = `Enrollment Sample`,
+    Three_Month_Sample      = `3 Month Sample`,
+    Four_Six_Month_Sample   = `4-6 month Sample`
+  ) %>%
+  mutate(
+    Genetic_Risk_Group = case_when(
+      Genetic_Risk == "Negative" ~ "Negative",
+      Genetic_Risk %in% c(
+        "DQ2.2/2.5 Homozygous",
+        "DQ2.5 Homozygous"
+      ) ~ "High",
+      TRUE ~ "Standard"
+    ),
+    Genetic_Risk_Group = factor(
+      Genetic_Risk_Group,
+      levels = c("Negative", "Standard", "High")
+    ),
+    Exposure_to_Environmental_Factors = factor(
+      Exposure_to_Environmental_Factors,
+      levels = c("Not exposed", "Exposed")
+    ),
+    Delivery_Mode  = factor(Delivery_Mode),
+    Feeding_Type   = factor(Feeding_Type),
+    country        = factor(country),
+    Gender         = factor(Gender)
+  )
+
+metadata %>% count(Genetic_Risk_Group)
+metadata %>% count(Exposure_to_Environmental_Factors)
+```
+
+# Lectura de matrices ómicas — Species y Pathways
+
+Las matrices de especies y pathways están organizadas con las variables ómicas en filas y los sujetos en columnas, y cada punto de tiempo tiene su propia hoja. Se define una función reutilizable que lee una hoja, transpone la matriz para que cada fila sea una muestra, y añade la etiqueta del punto de tiempo. Luego se apilan las tres hojas verticalmente con `bind_rows`.
+
+```{r}
+read_omic_wide <- function(file, sheet, time_label, feature_col) {
+  df <- read_excel(file, sheet = sheet)
+
+  df %>%
+    rename(feature = all_of(feature_col)) %>%
+    pivot_longer(
+      cols      = -feature,
+      names_to  = "PaperID",
+      values_to = "abundance"
+    ) %>%
+    mutate(time_point = time_label) %>%
+    pivot_wider(
+      names_from  = feature,
+      values_from = abundance
+    )
+}
+```
+
+```{r}
+species_data <- bind_rows(
+  read_omic_wide(file_species, "Enrollment",  "Enrollment", "Taxonomy"),
+  read_omic_wide(file_species, "3 months",    "3_months",   "Taxonomy"),
+  read_omic_wide(file_species, "4-6 months",  "4_6_months", "Taxonomy")
+)
+
+pathways_data <- bind_rows(
+  read_omic_wide(file_pathways, "Enrollment",  "Enrollment", "Taxonomy"),
+  read_omic_wide(file_pathways, "3 months",    "3_months",   "Taxonomy"),
+  read_omic_wide(file_pathways, "4-6 months",  "4_6_months", "Taxonomy")
+)
+
+dim(species_data)
+dim(pathways_data)
+```
+
+# Lectura de matriz de metabolómica
+
+La matriz de metabolómica ya viene en el formato correcto: sujetos en filas y metabolitos en columnas. Solo es necesario leer cada hoja y añadir la etiqueta del punto de tiempo antes de apilarlas.
+
+```{r}
+read_metab <- function(file, sheet, time_label) {
+  read_excel(file, sheet = sheet) %>%
+    mutate(time_point = time_label)
+}
+
+metabolites_data <- bind_rows(
+  read_metab(file_metab, "Enrollment",  "Enrollment"),
+  read_metab(file_metab, "3 months",    "3_months"),
+  read_metab(file_metab, "4-6 months",  "4_6_months")
+)
+
+dim(metabolites_data)
+```
+
+# Unión con metadatos
+
+Se unen los metadatos con cada matriz ómica mediante el identificador de sujeto. Esto añade las variables demográficas y de exposición a cada fila de las matrices, que son necesarias para los análisis posteriores.
+
+```{r}
+species_data <- species_data %>%
+  left_join(metadata, by = "PaperID") %>%
+  mutate(PaperID = factor(PaperID))
+
+pathways_data <- pathways_data %>%
+  left_join(metadata, by = "PaperID") %>%
+  mutate(PaperID = factor(PaperID))
+
+metabolites_data <- metabolites_data %>%
+  left_join(metadata, by = "PaperID") %>%
+  mutate(PaperID = factor(PaperID))
+
+cat("Species con metadata:    ", nrow(species_data), "filas,", ncol(species_data), "columnas\n")
+cat("Pathways con metadata:   ", nrow(pathways_data), "filas,", ncol(pathways_data), "columnas\n")
+cat("Metabolitos con metadata:", nrow(metabolites_data), "filas,", ncol(metabolites_data), "columnas\n")
+```
+
+Se verifica que no haya duplicados (PaperID, time_point) por ómica, ya que
+un duplicado indicaría un problema de lectura de las hojas de Excel
+antes de continuar con el preprocesado.
+
+```{r}
+species_data     %>% count(PaperID, time_point) %>% filter(n > 1)
+pathways_data    %>% count(PaperID, time_point) %>% filter(n > 1)
+metabolites_data %>% count(PaperID, time_point) %>% filter(n > 1)
+```
+
+# Guardado de datos
+
+```{r}
+processed_dir <- here("data", "processed", "leonard_2020")
+
+dir.create(processed_dir, recursive = TRUE, showWarnings = FALSE)
+
+saveRDS(metadata,         file.path(processed_dir, "metadata.rds"))
+saveRDS(species_data,     file.path(processed_dir, "species_data.rds"))
+saveRDS(pathways_data,    file.path(processed_dir, "pathways_data.rds"))
+saveRDS(metabolites_data, file.path(processed_dir, "metabolites_data.rds"))
+```

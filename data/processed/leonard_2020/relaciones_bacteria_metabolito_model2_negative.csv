@@ -1,0 +1,9 @@
+metabolito,bacteria,p_perm,en_VIP,coeficiente
+Glycine,Clostridium_hathewayi,0.03,TRUE,0.17923401064167785
+Glycine,Bifidobacterium_breve,0.045,TRUE,-0.21093091977915407
+Malic.acid,Parabacteroides_distasonis,0.047,TRUE,0.16530494776528315
+Malic.acid,Clostridium_innocuum,0.048,TRUE,-0.1525431653178597
+X4.Hydroxycyclohexylcarboxylic.acid,Clostridium_hathewayi,0.001,TRUE,0.24469290767676186
+X4.Hydroxycyclohexylcarboxylic.acid,Clostridium_orbiscindens,0.003,TRUE,0.2028621825590211
+X4.Hydroxycyclohexylcarboxylic.acid,Clostridium_bolteae,0.011,TRUE,0.20999963703135538
+X4.Hydroxycyclohexylcarboxylic.acid,Bifidobacterium_breve,0.015,TRUE,-0.18880422579664904

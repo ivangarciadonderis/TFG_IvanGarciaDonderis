@@ -1,0 +1,267 @@
+---
+title: "Carga de datos — Leonard et al. (2021)"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+date: "2026-06-28"
+---
+
+Este script constituye el primer paso del análisis. Su objetivo es leer los archivos suplementarios del estudio Leonard et al. (PNAS, 2021), construir las estructuras de datos necesarias y guardarlas procesadas para su uso en scripts posteriores. Se trabaja con cuatro fuentes de datos: metadatos demográficos de los sujetos (SD01), abundancias de especies bacterianas (SD02), abundancias de rutas funcionales KEGG (SD03) y perfiles metabolómicos (SD04).
+
+# Carga de librerías
+
+```{r}
+library(tidyverse)
+library(readxl)
+library(tibble)
+library(here)
+```
+
+# Lectura de datos
+
+Se definen las rutas a los archivos suplementarios del estudio. Todos los datos en crudo se encuentran en la carpeta `raw/leonard_2021`.
+
+```{r}
+data_dir <- here("data", "raw", "leonard_2021")
+
+file_sd01 <- file.path(data_dir, "pnas.2020322118.sd01.xlsx")
+file_sd02 <- file.path(data_dir, "pnas.2020322118.sd02.xlsx")
+file_sd03 <- file.path(data_dir, "pnas.2020322118.sd03.xlsx")
+file_sd04 <- file.path(data_dir, "pnas.2020322118.sd04.xlsx")
+```
+
+# Metadatos de sujetos
+
+Se carga la tabla de metadatos demográficos de los sujetos. A partir del identificador de cada individuo (`PaperID`) se genera una variable de grupo, distinguiendo entre casos y controles, y se extrae el identificador de pareja (`pair_id`) para conservar el emparejamiento del diseño experimental. Además, se transforma la edad de diagnóstico a formato numérico en meses, ya que posteriormente se utilizará para calcular el tiempo relativo de cada muestra respecto al inicio de la enfermedad.
+
+```{r}
+metadata_subjects <- read_excel(
+  file_sd01,
+  sheet = "Demographic Metadata",
+  skip = 1,
+  na = c(".", "n/a", "NA", "")
+)
+```
+
+
+```{r}
+metadata_subjects <- metadata_subjects %>%
+  mutate(
+    PaperID = as.character(PaperID),
+    group = if_else(str_detect(PaperID, "^Case"), "Case", "Control"),
+    pair_id = as.integer(str_extract(PaperID, "\\d+")),
+    Age_at_Diagnosis_months = readr::parse_number(as.character(Age_at_Diagnosis))
+  )
+
+glimpse(metadata_subjects)
+table(metadata_subjects$group)
+```
+
+# Tiempo relativo al onset
+
+El diseño del estudio toma como referencia temporal el momento del diagnóstico de celiaquía (t = 0). Cada caso tiene su propio mes de diagnóstico, y su control emparejado comparte esa misma referencia. Para implementar esto, se extrae el mes de diagnóstico de cada caso y se propaga al control correspondiente mediante el identificador de pareja. Así, el tiempo relativo de cualquier muestra se calcula como la diferencia entre el mes de recogida y el mes de diagnóstico de su pareja.
+
+```{r}
+onset_by_pair <- metadata_subjects %>%
+  filter(group == "Case") %>%
+  select(pair_id, onset_month = Age_at_Diagnosis_months)
+
+metadata_subjects <- metadata_subjects %>%
+  left_join(onset_by_pair, by = "pair_id")
+
+metadata_subjects %>%
+  select(PaperID, group, pair_id, Age_at_Diagnosis_months, onset_month)
+```
+
+# Lectura de matrices ómicas
+
+Se cargan las tres matrices de datos ómicos: especies bacterianas, rutas funcionales y metabolitos. Se comprueba la dimensión de cada una y los primeros nombres de columna para verificar que la lectura es correcta.
+
+```{r}
+species_raw <- read_excel(
+  file_sd02,
+  sheet = "Species_abundance"
+)
+
+pathways_raw <- read_excel(
+  file_sd03,
+  sheet = "Pathway abundance"
+)
+
+metabolites_raw <- read_excel(
+  file_sd04,
+  sheet = "Metabolite abundance",
+  na = c(".", "n/a", "NA", "")
+)
+
+dim(species_raw)
+dim(pathways_raw)
+dim(metabolites_raw)
+
+names(species_raw)[1:5]
+names(pathways_raw)[1:5]
+names(metabolites_raw)[1:5]
+```
+
+# Función de extracción de metadatos de muestra
+
+Las matrices de especies y pathways están en formato ancho: las filas son variables ómicas (especies o rutas) y las columnas son muestras, cuyos nombres codifican el grupo, la pareja, el sujeto y el mes de recogida. Se define una función reutilizable que parsea esos nombres de columna para construir la tabla de metadatos de muestra. También incorpora el mes de diagnóstico de cada pareja y calcula el tiempo relativo.
+
+```{r}
+create_sample_metadata_from_wide <- function(data, feature_col, onset_table) {
+  
+  tibble(sample_id = names(data)) %>%
+    filter(sample_id != feature_col) %>%
+    mutate(
+      group      = str_extract(sample_id, "^(Case|Control)"),
+      pair_id    = as.integer(str_match(sample_id, "^(?:Case|Control)_(\\d+)_")[, 2]),
+      PaperID    = paste(group, pair_id, sep = "_"),
+      time_label = str_to_lower(str_remove(sample_id, "^(?:Case|Control)_\\d+_")),
+      sample_month = as.numeric(str_extract(time_label, "\\d+(?=_month$)"))
+    ) %>%
+    left_join(onset_table, by = "pair_id") %>%
+    mutate(
+      relative_month = sample_month - onset_month
+    )
+}
+```
+
+Se aplica la función a las matrices de especies y pathways.
+
+```{r}
+species_sample_metadata <- create_sample_metadata_from_wide(
+  data        = species_raw,
+  feature_col = "Species",
+  onset_table = onset_by_pair
+)
+
+pathways_sample_metadata <- create_sample_metadata_from_wide(
+  data        = pathways_raw,
+  feature_col = "Pathways",
+  onset_table = onset_by_pair
+)
+
+head(species_sample_metadata)
+head(pathways_sample_metadata)
+```
+
+# Transposición y unión con metadatos — Species y Pathways
+
+Las matrices de especies y rutas funcionales estaban originalmente organizadas con las variables ómicas en filas y las muestras en columnas. Para poder aplicar análisis multivariantes y modelos estadísticos, se transpone cada matriz de modo que cada fila represente una muestra y cada columna una variable ómica. Posteriormente se añaden los metadatos de muestra y las covariables demográficas del sujeto (país, sexo, tipo de parto y riesgo genético).
+
+```{r}
+species_matrix <- species_raw %>%
+  rename(feature = Species) %>%
+  column_to_rownames("feature") %>%
+  as.matrix() %>%
+  t() %>%
+  as.data.frame(check.names = FALSE) %>%
+  rownames_to_column("sample_id") %>%
+  as_tibble()
+
+species_data <- species_sample_metadata %>%
+  left_join(species_matrix, by = "sample_id") %>%
+  left_join(
+    metadata_subjects %>%
+      select(PaperID, Country, Gender, Delivery_Mode, Genetic_Risk),
+    by = "PaperID"
+  )
+
+dim(species_data)
+head(species_data[, 1:10])
+```
+
+```{r}
+pathways_matrix <- pathways_raw %>%
+  rename(feature = Pathways) %>%
+  column_to_rownames("feature") %>%
+  as.matrix() %>%
+  t() %>%
+  as.data.frame(check.names = FALSE) %>%
+  rownames_to_column("sample_id") %>%
+  as_tibble()
+
+pathways_data <- pathways_sample_metadata %>%
+  left_join(pathways_matrix, by = "sample_id") %>%
+  left_join(
+    metadata_subjects %>%
+      select(PaperID, Country, Gender, Delivery_Mode, Genetic_Risk),
+    by = "PaperID"
+  )
+
+dim(pathways_data)
+head(pathways_data[, 1:10])
+```
+
+# Procesamiento de la matriz de metabolómica
+
+Para la matriz de metabolómica no es necesario transponer los datos, ya que las muestras están organizadas en filas y los metabolitos en columnas. Se procesan las variables de identificación para obtener el grupo, el identificador de pareja, el mes de recogida y el tiempo relativo respecto al inicio de la enfermedad. También se incorporan las covariables demográficas del sujeto.
+
+```{r}
+names(metabolites_raw) <- stringr::str_trim(names(metabolites_raw))
+
+metabolites_data <- metabolites_raw %>%
+  rename(
+    relative_time_label = `Relative Timepoint to Onset or Time 0`
+  ) %>%
+  mutate(
+    PaperID  = as.character(PaperID),
+    group    = if_else(str_detect(PaperID, "^Case"), "Case", "Control"),
+    pair_id  = as.integer(str_extract(PaperID, "\\d+")),
+    sample_month = as.numeric(str_extract(as.character(TimePoint), "\\d+")),
+    relative_time_label = str_trim(as.character(relative_time_label)),
+    relative_month = case_when(
+      str_detect(relative_time_label, "Onset") ~ 0,
+      TRUE ~ as.numeric(str_extract(relative_time_label, "-?\\d+"))
+    ),
+    sample_id = paste(PaperID, sample_month, "month", sep = "_")
+  ) %>%
+  left_join(
+    metadata_subjects %>%
+      select(PaperID, Country, Gender, Delivery_Mode, Genetic_Risk),
+    by = "PaperID"
+  )
+
+dim(metabolites_data)
+head(metabolites_data[, 1:10])
+```
+
+# Filtrado a la ventana temporal del estudio
+
+Se restringe el análisis a la ventana temporal del estudio: desde 18 meses antes del diagnóstico hasta el momento del diagnóstico (t = 0), con puntos de tiempo en −18, −15, −12, −9, −6, −3 y 0 meses. Se generan tablas de recuento por grupo y tiempo relativo para verificar que el filtrado es coherente con el diseño longitudinal.
+
+```{r}
+relative_times_keep <- c(-18, -15, -12, -9, -6, -3, 0)
+
+species_data_window    <- species_data    %>% filter(relative_month %in% relative_times_keep)
+pathways_data_window   <- pathways_data   %>% filter(relative_month %in% relative_times_keep)
+metabolites_data_window <- metabolites_data %>% filter(relative_month %in% relative_times_keep)
+
+species_data_window    %>% count(group, relative_month)
+pathways_data_window   %>% count(group, relative_month)
+metabolites_data_window %>% count(group, relative_month)
+```
+
+```{r}
+dim(species_data_window)
+dim(pathways_data_window)
+dim(metabolites_data_window)
+```
+
+# Guardado de datos
+
+Se guardan los objetos procesados en formato `.rds` para su uso en los scripts de preprocesamiento, tablas de frecuencias y PCA.
+
+```{r}
+output_dir <- here("data", "processed", "leonard_2021")
+
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+saveRDS(metadata_subjects,       file.path(output_dir, "metadata_subjects.rds"))
+saveRDS(species_data_window,     file.path(output_dir, "species_data_window.rds"))
+saveRDS(pathways_data_window,    file.path(output_dir, "pathways_data_window.rds"))
+saveRDS(metabolites_data_window, file.path(output_dir, "metabolites_data_window.rds"))
+```
+

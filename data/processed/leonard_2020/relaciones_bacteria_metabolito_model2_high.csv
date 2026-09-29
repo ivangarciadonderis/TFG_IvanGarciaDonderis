@@ -1,0 +1,8 @@
+metabolito,bacteria,p_perm,en_VIP,coeficiente
+Erythritol,Parabacteroides_distasonis,0.038,TRUE,0.14324330933197063
+Galactaric.acid,Clostridium_orbiscindens,0.042,TRUE,-0.12820427167326537
+Galactaric.acid,Parabacteroides_distasonis,0.047,TRUE,0.13508100348828725
+Glycolic.acid,Bacteroides_thetaiotaomicron,0.02,TRUE,0.13918953016838329
+Glycolic.acid,Veillonella_u_s,0.021,TRUE,-0.14666466923285604
+Glycolic.acid,Streptococcus_thermophilus,0.033,TRUE,-0.1462628841439654
+Methionine,Streptococcus_vestibularis,0.037,TRUE,0.13029189039397895

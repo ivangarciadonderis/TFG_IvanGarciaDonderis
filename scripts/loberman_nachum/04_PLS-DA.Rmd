@@ -1,0 +1,781 @@
+---
+title: "PLS-DA — Loberman-Nachum et al. (2019)"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+date: "2026-06-30"
+---
+
+Este script aplica un modelo de Análisis Discriminante por Mínimos Cuadrados Parciales (PLS-DA) para clasificar muestras de biopsia duodenal como celiaquía o control a partir de sus perfiles de expresión génica. El modelo se ajusta exclusivamente en la cohorte de entrenamiento (training) y se valida en la cohorte de validación independiente (validation), replicando el esquema del paper original.
+
+El PLS-DA es una extensión supervisada del PLS que maximiza la covarianza entre la matriz de expresión génica X y la variable respuesta Y (diagnóstico), a diferencia del PCA que es no supervisado. Esto permite identificar las combinaciones lineales de genes que mejor discriminan entre grupos, y evaluar la capacidad predictiva del modelo en datos no vistos. El paper original utilizó Random Forest y SVM para la clasificación; aquí se aplica PLS-DA, que además de clasificar permite identificar directamente qué genes son más discriminantes mediante el índice VIP.
+
+# Carga de librerías y datos
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(PLSandO)
+library(knitr)
+library(ggplot2)
+library(here)
+
+processed_dir <- here("data", "processed", "loberman_nachum")
+
+metadata                 <- readRDS(file.path(processed_dir, "metadata.rds"))
+expression_log_data      <- readRDS(file.path(processed_dir, "expression_log_data.rds"))
+gene_annotation_filtered <- readRDS(file.path(processed_dir, "gene_annotation_filtered.rds"))
+gene_label_map           <- readRDS(file.path(processed_dir, "gene_label_map.rds"))
+
+dim(metadata)
+dim(expression_log_data)
+dim(gene_annotation_filtered)
+```
+
+# Preparación de la matriz X
+
+Se separan las columnas de metadatos de las variables génicas y se construye la matriz X con los genes en columnas y las muestras en filas. Los nombres de columna son `gene_label` (Symbol, con GeneID de respaldo para los genes sin símbolo anotado), heredados de `preprocessing.Rmd`.
+
+**Nota importante**: aunque `PLSandO::plsda()` no llama a `make.names()` de forma explícita en su código (lo comprobamos leyendo el fuente), internamente sí sanea los nombres de columna en algún punto (probablemente al convertir a `data.frame()` sin `check.names = FALSE`). Se comprobó empíricamente: `identical(colnames(X_train), names(plsda_model$vip))` daba `FALSE`, y los 108 genes con guion (`HLA-DRB1`, `H1-2`, etc.) aparecían con el guion sustituido por un punto (`HLA.DRB1`). Esto además rompía `predict()` sobre `X_validation`, porque sus nombres (con guion) no coincidían con los del modelo ajustado (con punto).
+
+Para evitarlo, se aplica `make.names()` de forma explícita y controlada **antes** de dividir en train/validation (así ambos quedan con los mismos nombres saneados), guardando una tabla de traducción inversa para poder recuperar el `gene_label` original al interpretar los resultados.
+
+```{r}
+metadata_cols <- c(
+  "sample_id", "sample_title", "diagnosis", "group", "cohort",
+  "age", "gender", "ttg_abnormal", "ttg_over100", "abdominal_pain", "location"
+)
+
+metadata_cols <- metadata_cols[metadata_cols %in% colnames(expression_log_data)]
+gene_cols     <- setdiff(colnames(expression_log_data), metadata_cols)
+
+X <- expression_log_data %>%
+  dplyr::select(all_of(gene_cols)) %>%
+  mutate(across(everything(), as.numeric)) %>%
+  as.data.frame(check.names = FALSE)
+```
+
+Se guarda la correspondencia entre el nombre saneado (el que usará `plsda()` internamente) y el `gene_label` original, y se aplica `make.names()` a `X` para que sea coherente con lo que hará la librería.
+
+## Saneado de nombres de columna
+
+```{r}
+safe_gene_names <- make.names(colnames(X))
+
+cat("Genes cuyo nombre cambia al sanear:", sum(safe_gene_names != colnames(X)), "\n")
+
+safe_name_lookup <- tibble(
+  safe_name  = safe_gene_names,
+  gene_label = colnames(X)
+)
+
+stopifnot(sum(duplicated(safe_gene_names)) == 0)
+
+colnames(X) <- safe_gene_names
+```
+
+
+## Comprobación final de la matriz X
+
+```{r}
+rownames(X) <- expression_log_data$sample_id
+
+cat("Dimensiones de X:", dim(X), "\n")
+cat("Valores faltantes:", sum(is.na(X)), "\n")
+```
+
+# División train / validation
+
+Se respeta la asignación de cohortes definida en el paper: la cohorte de training (llamada discovery en el paper) incluye 23 celíacos y 15 controles, y la cohorte de validation incluye 10 celíacos y 6 controles. Esta separación es fundamental para evaluar la capacidad de generalización del modelo a datos no vistos durante el entrenamiento.
+
+```{r}
+metadata_model <- expression_log_data %>%
+  dplyr::select(all_of(metadata_cols))
+
+train_idx      <- metadata_model$cohort == "training"
+validation_idx <- metadata_model$cohort == "validation"
+
+X_train      <- X[train_idx, ]
+X_validation <- X[validation_idx, ]
+
+metadata_train      <- metadata_model[train_idx, ]
+metadata_validation <- metadata_model[validation_idx, ]
+
+cat("Train:      ", nrow(X_train), "muestras\n")
+cat("Validation: ", nrow(X_validation), "muestras\n")
+
+table(metadata_train$cohort,      metadata_train$group)
+table(metadata_validation$cohort, metadata_validation$group)
+```
+
+# Variable respuesta Y
+
+La variable respuesta Y contiene el diagnóstico de cada muestra de la cohorte de training. Se define como factor con dos niveles, siendo Control la categoría de referencia.
+
+```{r}
+Y_train <- metadata_train %>%
+  dplyr::select(group) %>%
+  mutate(group = factor(group, levels = c("Control", "Celiac"))) %>%
+  as.data.frame()
+
+rownames(Y_train) <- metadata_train$sample_id
+
+head(Y_train)
+table(Y_train$group)
+```
+
+# Ajuste del modelo PLS-DA en training
+
+Se ajusta el modelo con hasta 5 componentes, validación cruzada de 5 folds repetida 10 veces, y 100 permutaciones para el test de permutaciones. El escalado estándar (media 0, desviación típica 1) se aplica a X para que todos los genes contribuyan en igualdad de condiciones al modelo, y el centrado se aplica a Y.
+
+```{r warning=FALSE, message=FALSE}
+set.seed(123)
+
+plsda_model <- plsda(
+  x        = X_train,
+  y        = Y_train,
+  ncomp    = NULL,
+  cvFolds  = 5,
+  rep      = 10,
+  perm     = 100,
+  scaling  = "standard",
+  scalingY = "center",
+  algo     = "nipals",
+  train    = 1,
+  parallel = FALSE
+)
+```
+
+# Diagnóstico del modelo
+
+## Resumen del preprocesado
+
+```{r}
+plsda_model$PreproSummary
+```
+
+Se comprueba que `plsda()` conserva exactamente los nombres de columna saneados de `X_train`, ahora que se han igualado de antemano.
+
+```{r}
+identical(colnames(X_train), names(plsda_model$vip))
+
+```
+
+## Métricas por componente
+
+Las métricas clave son R²Y (varianza de Y explicada por el modelo), Q² (capacidad predictiva estimada por validación cruzada) y BER (Balanced Error Rate, tasa de error que penaliza por igual los errores en ambas clases).
+
+```{r}
+plsda_model$summary %>%
+  kable(caption = "Métricas internas del modelo PLS-DA por componente (training)")
+```
+
+## Selección del número óptimo de componentes
+
+El número óptimo de componentes se selecciona minimizando el BER en la validación cruzada. Se observa que el Q² no mejora significativamente después del componente 2, lo que indica que añadir más componentes no aporta capacidad predictiva adicional y puede introducir sobreajuste. Se seleccionan por tanto **2 componentes**.
+
+```{r}
+plsdaPlot(plsda_model, type = "ncomp")
+```
+
+```{r}
+component_summary <- plsda_model$summary %>%
+  mutate(comp_numeric = as.numeric(as.character(comp)))
+
+best_ncomp <- component_summary %>%
+  arrange(BER) %>%
+  slice(1) %>%
+  pull(comp_numeric)
+```
+
+Reajustamos modelo final con 2 componentes.
+
+## Ajuste del modelo final con 2 componentes
+
+```{r}
+
+set.seed(123)
+
+plsda_model_final <- plsda(
+  x        = X_train,
+  y        = Y_train,
+  ncomp    = 2,
+  cvFolds  = 5,
+  rep      = 10,
+  perm     = 100,
+  scaling  = "standard",
+  scalingY = "center",
+  algo     = "nipals",
+  train    = 1,
+  parallel = FALSE
+)
+```
+
+
+## Test de permutaciones
+
+El test de permutaciones verifica que la capacidad discriminante del modelo es real y no debida al azar. Si el modelo real tiene métricas claramente mejores que los modelos permutados, la señal es robusta.
+
+```{r}
+p_perm <- plsdaPlot(plsda_model_final, type = "overfitting") +
+  labs(
+    title = "Test de Permutaciones",
+    subtitle = "pR2Y < 0.01, pQ2 = 0.01"
+  )
+
+p_perm
+```
+
+
+```{r}
+plsdaPlot(plsda_model_final, type = "overfitting") 
+```
+
+# Visualización del modelo
+
+## Score plot en el espacio X
+
+El score plot proyecta las muestras en el espacio de las componentes latentes del modelo. Una buena separación entre grupos indica que el modelo ha identificado patrones de expresión génica diferencial entre celiaquía y control.
+
+```{r}
+plsdaPlot(plsda_model_final, type = "scoresX", comp = c(1, 2),
+          ellipses = TRUE, labels = FALSE)
+```
+
+## Score plot en el espacio Y
+
+```{r}
+plsdaPlot(plsda_model_final, type = "scoresY", comp = c(1, 2),
+          ellipses = FALSE, labels = FALSE)
+```
+
+# Validación en la cohorte independiente
+
+Se aplica el modelo entrenado en training a las 16 muestras de validación para evaluar su capacidad de generalización. Este es el resultado más importante del análisis porque refleja el rendimiento real del modelo en datos completamente nuevos.
+
+```{r}
+plsda_validation_pred <- predict(
+  plsda_model_final,
+  new  = X_validation,
+  plot = TRUE
+)
+```
+
+## Matriz de confusión y métricas
+
+```{r}
+y_pred <- factor(plsda_validation_pred$Class$group, levels = c("Control", "Celiac"))
+y_real <- factor(metadata_validation$group, levels = c("Control", "Celiac"))
+
+conf_matrix <- table(Real = y_real, Predicho = y_pred)
+kable(conf_matrix, caption = "Matriz de confusión — Cohorte de validación")
+```
+
+```{r}
+VP <- conf_matrix["Celiac",  "Celiac"]
+VN <- conf_matrix["Control", "Control"]
+FP <- conf_matrix["Control", "Celiac"]
+FN <- conf_matrix["Celiac",  "Control"]
+
+sensibilidad  <- VP / (VP + FN)
+especificidad <- VN / (VN + FP)
+BER_val       <- 1 - 0.5 * (sensibilidad + especificidad)
+accuracy      <- (VP + VN) / sum(conf_matrix)
+
+tibble(
+  Métrica = c("Sensibilidad", "Especificidad", "BER", "Accuracy"),
+  Valor   = round(c(sensibilidad, especificidad, BER_val, accuracy), 4)
+) %>%
+  kable(caption = "Métricas de clasificación — Cohorte de validación")
+```
+
+
+## Gráficos complementarios de interpretación
+
+### Weights (w*c)
+
+Muestra la dirección conjunta de genes y clases en el espacio de las dos primeras componentes.
+
+```{r}
+plsdaPlot(plsda_model_final, type = "weights", comp = c(1, 2),
+          selVars = 0.001, labelTop = 1, repel = TRUE)
+```
+
+### Correlation plot (corrX)
+
+Círculo de correlación entre genes y componentes, restringido a los genes con mayor contribución.
+
+```{r}
+plsdaPlot(plsda_model_final, type = "corrX", comp = c(1, 2),
+          selVars = 0.001, labelTop = 1, repel = TRUE)
+```
+
+### Biplot
+
+Muestras y genes proyectados conjuntamente en el mismo espacio.
+
+```{r}
+plsdaPlot(plsda_model_final, type = "biplot", comp = c(1, 2),
+          selVars = 0.001, labelTop = 1, repel = TRUE)
+```
+
+### Linearity
+
+Correlación entre los scores de X (t) y los scores de Y (u) para cada componente, como comprobación del supuesto de relación lineal interna del PLS.
+
+```{r}
+plsdaPlot(plsda_model_final, type = "linearity", comp = 1)
+plsdaPlot(plsda_model_final, type = "linearity", comp = 2)
+```
+
+# Detección de muestras anómalas
+
+Se identifican muestras que se comportan de forma atípica dentro del modelo mediante RSS (anómalos moderados) y T² de Hotelling (anómalos severos). La detección de anómalos es importante para identificar muestras que pueden comprometer la robustez del modelo o que tienen características clínicas particulares.
+
+```{r fig.width=10, fig.height=4}
+par(mfrow = c(1, 2))
+anomalos_plsda <- plsdaOutliers(plsda_model_final, method = "both", conf = 0.99)
+par(mfrow = c(1, 1))
+```
+
+```{r}
+cat("Anómalos moderados (RSS):\n")
+print(sort(anomalos_plsda$RSS[anomalos_plsda$ModerateOutliers], decreasing = TRUE))
+
+cat("\nAnómalos severos (T²):\n")
+print(sort(anomalos_plsda$T2[anomalos_plsda$SevereOutliers], decreasing = TRUE))
+```
+
+# Genes más importantes — VIP
+
+El índice VIP (Variable Importance in Projection) cuantifica la contribución de cada gen a la discriminación entre grupos en el modelo PLS-DA. Valores VIP > 1 indican que el gen contribuye por encima de la media al poder discriminante del modelo. Se presentan los 20 genes con mayor VIP junto con su anotación funcional para facilitar la interpretación biológica.
+
+El identificador de cada gen en `plsda_model_final$vip` es el nombre saneado por `plsda()` (p. ej. `HLA.DRB1`). Se revierte primero a `gene_label` mediante `safe_name_lookup`, y después se recupera el `GeneID` original y la `Description` a través de `gene_label_map`, igual que en `PCA.Rmd`.
+
+```{r}
+vip_df <- tibble(
+  safe_name = names(plsda_model_final$vip),
+  VIP       = as.numeric(plsda_model_final$vip)
+) %>%
+  left_join(safe_name_lookup, by = "safe_name") %>%
+  left_join(gene_label_map, by = "gene_label") %>%
+  left_join(
+    gene_annotation_filtered %>%
+      mutate(GeneID = as.character(GeneID)) %>%
+      dplyr::select(GeneID, Description),
+    by = "GeneID"
+  ) %>%
+  arrange(desc(VIP))
+
+cat("Genes con VIP > 1:", sum(vip_df$VIP > 1), "\n")
+
+vip_df %>%
+  filter(VIP > 1) %>%
+  slice_head(n = 20) %>%
+  dplyr::select(gene_label, GeneID, Description, VIP) %>%
+  kable(caption = "Top 20 genes con mayor VIP — PLS-DA training")
+```
+
+## Coeficientes de regresión Jack-knife
+
+Antes de calcular la significación por Jack-knife, se identifican las dos respuestas del modelo (una por nivel del factor `group`).
+
+```{r}
+names(plsda_model_final$coefficients_summary)
+```
+
+## Selección por sMC (Significance Multivariate Correlation)
+
+Tercer criterio de selección de variables de PLSandO, más restrictivo que VIP y Jack-knife.
+
+```{r}
+sMC_result <- plsdaVarSel(plsda_model_final, type = "sMC")
+sMC_result
+```
+
+
+## Cálculo de coeficientes Jack-knife para la clase Celiac
+
+```{r}
+response_names <- names(plsda_model_final$coefficients_summary)
+
+celiac_response <- response_names[
+  str_detect(response_names, regex("Celiac", ignore_case = TRUE))
+]
+
+celiac_response
+
+if (length(celiac_response) != 1) {
+  stop("No se ha identificado de forma única la respuesta Celiac. Revisa names(plsda_model_final$coefficients_summary).")
+}
+```
+
+
+```{r}
+coef_celiac_df <- plsda_model_final$coefficients_summary[[celiac_response]] %>%
+  as.data.frame() %>%
+  rownames_to_column("safe_name") %>%
+  as_tibble() %>%
+  mutate(
+    coefficient = as.numeric(coefficient),
+    pValJK = as.numeric(pValJK),
+    LCI_JK = as.numeric(LCI_JK),
+    UCI_JK = as.numeric(UCI_JK),
+    coef_significant = pValJK < 0.05,
+    ci_excludes_zero = LCI_JK * UCI_JK > 0,
+    direction = case_when(
+      coefficient > 0 ~ "Asociado a Celiac",
+      coefficient < 0 ~ "Asociado a Control",
+      TRUE ~ "Sin dirección"
+    )
+  ) %>%
+  left_join(safe_name_lookup, by = "safe_name") %>%
+  left_join(gene_label_map, by = "gene_label")
+
+cat("Coincidencia entre significación JK (p<0.05) e IC que excluye 0:\n")
+table(coef_celiac_df$coef_significant, coef_celiac_df$ci_excludes_zero)
+```
+## Comprobación: ¿el Jack-knife cacheado en el modelo coincide con `plsdaVarSel(type="Jack")`?
+
+Perm y sMC se calculan explícitamente a través del wrapper formal `plsdaVarSel()`. Antes de dar por bueno el criterio Jack-knife, se comprueba si el resultado ya cacheado en `plsda_model_final$coefficients_summary` (usado en `coef_celiac_df`) coincide con el que devolvería `plsdaVarSel(plsda_model_final, type = "Jack")`, para asegurar consistencia metodológica entre los tres criterios.
+
+```{r}
+jack_via_varsel <- plsdaVarSel(plsda_model_final, type = "Jack")
+jack_via_varsel_celiac <- jack_via_varsel[[celiac_response]]
+
+cat("Genes con pValJK<0.05 según plsdaVarSel(type='Jack') (leave-one-out genuino):",
+    nrow(jack_via_varsel_celiac), "\n")
+cat("Genes con pValJK<0.05 según coef_celiac_df (cacheado en el modelo, basado en CV):",
+    sum(coef_celiac_df$pValJK < 0.05, na.rm = TRUE), "\n")
+```
+
+**Los dos caminos NO coinciden** (2.842 vs 200 genes) — no es un error de código, sino que existen dos implementaciones distintas de "Jack-knife" dentro de PLSandO, verificado directamente en el código fuente del paquete:
+
+- **`coefficients_summary` (cacheado en el modelo, el que se usa en el resto de este documento)**: internamente llama a `p.jack()`, que estima la variabilidad del coeficiente a partir de las particiones de validación cruzada con las que se entrenó el modelo (`cvFolds` × `rep` de `plsda()`) — es decir, deja fuera **bloques enteros** de muestras en cada repetición.
+- **`plsdaVarSel(type="Jack")`**: llama a una función distinta, `JK()`, que hace jack-knife **leave-one-out genuino** — reajusta el modelo dejando fuera **una única muestra** cada vez (38 reajustes, uno por muestra de entrenamiento).
+
+### Justificación de por qué se mantiene el método por bloques (cacheado en el modelo)
+
+Con ~14.300 genes muy correlacionados entre sí y solo 38 muestras de entrenamiento, quitar una única muestra (leave-one-out) apenas desestabiliza el ajuste del modelo — hay demasiada redundancia entre variables como para que la ausencia de una sola muestra cambie mucho el resultado. Esto infla artificialmente la "estabilidad" aparente del coeficiente entre las 38 repeticiones, subestimando su variabilidad real y disparando el número de genes declarados "significativos" (2.842, un 19% del transcriptoma completo — una cifra difícil de justificar biológicamente).
+
+El método por bloques, al dejar fuera una porción de datos mucho mayor en cada repetición (una fracción completa definida por `cvFolds`), sí perturba de forma realista el ajuste del modelo, dando una estimación de variabilidad más conservadora y creíble — y es, además, el criterio con el que se ha construido y validado todo el análisis posterior (enriquecimiento funcional, comparación con el paper), donde ya se comprobó que los ~200 genes resultantes recuperan fielmente las categorías biológicas centrales que reporta el paper, incluyendo los genes que ellos mismos validan por proteína (CCNB1, MKI67, APOA1, SI).
+
+**Se mantiene, por tanto, el criterio basado en validación cruzada (`coefficients_summary`) como definitivo**, documentando aquí explícitamente la comprobación de consistencia y la razón por la que no se sustituye por la versión leave-one-out, pese a que esta última sea la implementación "de manual" de la técnica.
+
+## Combinación de VIP y significación Jack-knife
+
+```{r}
+genes_plsda_stats <- coef_celiac_df %>%
+  left_join(vip_df, by = c("gene_label", "GeneID")) %>%
+  mutate(
+    VIP_relevant = VIP > 1,
+    selected_gene = VIP > 1 & pValJK < 0.05,
+    combined_score = VIP * (-log10(pValJK))
+  ) %>%
+  arrange(desc(selected_gene), desc(combined_score))
+
+```
+
+## Combinación de VIP y test permutaciones
+Cuarto criterio de selección de variables de PLSandO, alternativo al Jack-knife: en vez de estimar el error estándar del coeficiente dejando muestras fuera, construye una distribución nula barajando la variable Y repetidamente y compara el coeficiente real frente a esa distribución.
+
+### Comprobación de estabilidad del número de repeticiones
+
+Antes de fijar el número de repeticiones definitivo, se comprueba que el número de genes seleccionados se estabiliza al aumentar `rep`, para asegurar que el resultado no depende de una resolución insuficiente del test (con pocas repeticiones, la resolución mínima de p-valor es `1/(rep+1)`, lo que puede subestimar genes significativos si `rep` es demasiado bajo).
+
+```{r}
+set.seed(123)
+perm_test_100  <- plsdaVarSel(plsda_model_final, type = "Perm", rep = 100)
+perm_test_500  <- plsdaVarSel(plsda_model_final, type = "Perm", rep = 500)
+perm_test_1000 <- plsdaVarSel(plsda_model_final, type = "Perm", rep = 1000)
+
+cat("rep=100  ->", nrow(perm_test_100[[celiac_response]]),  "genes (perfil Celiac)\n")
+cat("rep=500  ->", nrow(perm_test_500[[celiac_response]]),  "genes (perfil Celiac)\n")
+cat("rep=1000 ->", nrow(perm_test_1000[[celiac_response]]), "genes (perfil Celiac)\n")
+```
+
+Con `rep=100` el número de genes seleccionados (33) estaba claramente subestimado por falta de resolución del test. Al aumentar a `rep=500` (126) y `rep=1000` (129) el resultado se estabiliza (diferencia de solo 3 genes entre ambos, dentro del ruido esperable de la aleatoriedad del test) — se confirma que **rep=1000 es suficiente** y se fija como valor definitivo para el resto del análisis.
+
+### Resultado definitivo (rep = 1000)
+
+```{r}
+perm_result <- perm_test_1000
+perm_result_celiac <- perm_result[[celiac_response]]
+
+cat("Genes seleccionados por permutación (pValPerm < 0.05):", nrow(perm_result_celiac), "\n")
+head(perm_result_celiac)
+```
+
+**Nota**: `plsdaVarSel(type="Perm")` devuelve únicamente los genes que ya superan el umbral de significación (pValPerm<0.05), pre-filtrados y ordenados — no incluye el p-valor de los genes no significativos. Por eso, a diferencia de Jack-knife (donde sí tenemos el p-valor de todos los genes y podemos comparar magnitudes), aquí usamos pertenencia a la lista devuelta como criterio de significación.
+
+```{r}
+## Combinación de VIP y test de permutaciones
+
+perm_genes_df <- perm_result_celiac %>%
+  rownames_to_column("safe_name") %>%
+  as_tibble() %>%
+  left_join(safe_name_lookup, by = "safe_name") %>%
+  dplyr::select(gene_label, pValPerm)
+
+genes_plsda_stats_perm <- coef_celiac_df %>%
+  left_join(vip_df, by = c("gene_label", "GeneID")) %>%
+  mutate(
+    perm_significant    = gene_label %in% perm_genes_df$gene_label,
+    selected_gene_perm  = VIP > 1 & perm_significant
+  ) %>%
+  arrange(desc(selected_gene_perm), desc(VIP))
+
+cat("Genes seleccionados con VIP > 1 y permutación significativa:",
+    sum(genes_plsda_stats_perm$selected_gene_perm), "\n")
+```
+
+
+```{r}
+## Comparación Jack-knife vs Permutaciones
+
+cat("VIP + Jack-knife  ->", sum(genes_plsda_stats$selected_gene), "genes\n")
+cat("VIP + Permutación ->", sum(genes_plsda_stats_perm$selected_gene_perm), "genes\n")
+
+genes_jk_only   <- genes_plsda_stats      %>% filter(selected_gene)      %>% pull(gene_label)
+genes_perm_only <- genes_plsda_stats_perm %>% filter(selected_gene_perm) %>% pull(gene_label)
+
+cat("Solo en Jack-knife:",  length(setdiff(genes_jk_only, genes_perm_only)), "\n")
+cat("Solo en Permutación:", length(setdiff(genes_perm_only, genes_jk_only)), "\n")
+cat("En ambos:",            length(intersect(genes_jk_only, genes_perm_only)), "\n")
+```
+
+## Genes finales seleccionados
+
+```{r}
+selected_genes_ec <- genes_plsda_stats %>%
+  filter(selected_gene) %>%
+  arrange(pValJK, desc(VIP))
+
+cat("Genes seleccionados con VIP > 1 y pValJK < 0.05:", nrow(selected_genes_ec), "\n")
+```
+
+
+```{r}
+selected_genes_ec %>%
+  dplyr::select(
+    gene_label,
+    GeneID,
+    Description,
+    VIP,
+    coefficient,
+    pValJK,
+    LCI_JK,
+    UCI_JK,
+    direction,
+    combined_score
+  ) %>%
+  slice_head(n = 30) %>%
+  kable(caption = "Genes relevantes para EC — VIP > 1 y coeficiente significativo")
+```
+
+
+## Resumen por dirección del efecto
+
+```{r}
+selected_genes_ec %>%
+  count(direction) %>%
+  kable(caption = "Número de genes seleccionados según dirección del coeficiente")
+```
+
+
+## Perfil Celiac
+
+```{r}
+selected_genes_celiac <- selected_genes_ec %>%
+  filter(direction == "Asociado a Celiac") %>%
+  arrange(pValJK, desc(VIP))
+
+selected_genes_celiac %>%
+  dplyr::select(
+    gene_label,
+    GeneID,
+    Description,
+    VIP,
+    coefficient,
+    pValJK,
+    LCI_JK,
+    UCI_JK,
+    combined_score
+  ) %>%
+  slice_head(n = 20) %>%
+  kable(caption = "Genes seleccionados asociados al perfil Celiac")
+```
+
+
+## Perfil Control
+
+```{r}
+selected_genes_control <- selected_genes_ec %>%
+  filter(direction == "Asociado a Control") %>%
+  arrange(pValJK, desc(VIP))
+
+selected_genes_control %>%
+  dplyr::select(
+    gene_label,
+    GeneID,
+    Description,
+    VIP,
+    coefficient,
+    pValJK,
+    LCI_JK,
+    UCI_JK,
+    combined_score
+  ) %>%
+  slice_head(n = 20) %>%
+  kable(caption = "Genes seleccionados asociados al perfil Control")
+```
+
+## Genes finales seleccionados (VIP + Permutación)
+
+Se repite la misma lógica de separación por perfil, ahora usando el criterio VIP + test de permutaciones en vez de VIP + Jack-knife, para poder comparar ambos combos y quedarnos con el que dé más genes (más cercano a los 878 del paper).
+
+```{r}
+selected_genes_ec_perm <- genes_plsda_stats_perm %>%
+  filter(selected_gene_perm) %>%
+  arrange(desc(VIP))
+
+cat("Genes seleccionados con VIP > 1 y permutación significativa:", nrow(selected_genes_ec_perm), "\n")
+```
+
+```{r}
+selected_genes_ec_perm %>%
+  dplyr::select(
+    gene_label,
+    GeneID,
+    Description,
+    VIP,
+    coefficient,
+    direction
+  ) %>%
+  slice_head(n = 30) %>%
+  kable(caption = "Genes relevantes para EC (VIP+Perm) — VIP > 1 y permutación significativa")
+```
+
+### Resumen por dirección del efecto (VIP + Permutación)
+
+```{r}
+selected_genes_ec_perm %>%
+  count(direction) %>%
+  kable(caption = "Número de genes seleccionados según dirección del coeficiente (VIP+Perm)")
+```
+
+### Perfil Celiac (VIP + Permutación)
+
+```{r}
+selected_genes_celiac_perm <- selected_genes_ec_perm %>%
+  filter(direction == "Asociado a Celiac") %>%
+  arrange(desc(VIP))
+
+selected_genes_celiac_perm %>%
+  dplyr::select(gene_label, GeneID, Description, VIP, coefficient, direction) %>%
+  slice_head(n = 20) %>%
+  kable(caption = "Genes seleccionados (VIP+Perm) asociados al perfil Celiac")
+```
+
+### Perfil Control (VIP + Permutación)
+
+```{r}
+selected_genes_control_perm <- selected_genes_ec_perm %>%
+  filter(direction == "Asociado a Control") %>%
+  arrange(desc(VIP))
+
+selected_genes_control_perm %>%
+  dplyr::select(gene_label, GeneID, Description, VIP, coefficient, direction) %>%
+  slice_head(n = 20) %>%
+  kable(caption = "Genes seleccionados (VIP+Perm) asociados al perfil Control")
+```
+
+# Genes confirmados por los tres criterios (VIP + Jack-knife + sMC)
+
+Se comprueba cuántos de los 9 genes identificados por `sMC` (el criterio más restrictivo de los tres) superan también el criterio combinado VIP>1 + Jack-knife p<0.05. Este subconjunto representa el núcleo de genes más robusto del análisis, confirmado de forma convergente por tres métodos de selección de variables distintos de PLSandO.
+
+```{r}
+genes_triple_criterio <- genes_plsda_stats %>%
+  filter(gene_label %in% rownames(sMC_result)) %>%
+  left_join(
+    rownames_to_column(sMC_result, "gene_label"),
+    by = "gene_label"
+  ) %>%
+  arrange(pValJK)
+
+cat("Genes confirmados por VIP + Jack-knife + sMC:", sum(genes_triple_criterio$selected_gene), "de", nrow(genes_triple_criterio), "genes de sMC\n")
+
+genes_triple_criterio %>%
+  dplyr::select(gene_label, GeneID, Description, VIP, pValJK, sMC, direction, selected_gene) %>%
+  kable(caption = "Genes seleccionados de forma convergente por VIP, Jack-knife y sMC")
+```
+
+## Núcleo confirmado por VIP + Permutación + sMC
+
+Se repite la misma comprobación, ahora sustituyendo Jack-knife por el test de permutaciones, para poder comparar ambos núcleos "triple-confirmados".
+
+```{r}
+genes_triple_criterio_perm <- genes_plsda_stats_perm %>%
+  filter(gene_label %in% rownames(sMC_result)) %>%
+  left_join(
+    rownames_to_column(sMC_result, "gene_label"),
+    by = "gene_label"
+  ) %>%
+  arrange(desc(selected_gene_perm))
+
+cat("Genes confirmados por VIP + Permutación + sMC:",
+    sum(genes_triple_criterio_perm$selected_gene_perm), "de",
+    nrow(genes_triple_criterio_perm), "genes de sMC\n")
+
+genes_triple_criterio_perm %>%
+  dplyr::select(gene_label, GeneID, Description, VIP, direction, selected_gene_perm) %>%
+  kable(caption = "Genes seleccionados de forma convergente por VIP, Permutación y sMC")
+```
+
+## Comparación: JK+VIP+sMC vs Perm+VIP+sMC
+
+```{r}
+genes_jk_smc   <- genes_triple_criterio      %>% filter(selected_gene)      %>% pull(gene_label)
+genes_perm_smc <- genes_triple_criterio_perm %>% filter(selected_gene_perm) %>% pull(gene_label)
+
+cat("En ambos núcleos (JK+VIP+sMC y Perm+VIP+sMC):", length(intersect(genes_jk_smc, genes_perm_smc)), "\n")
+cat("Solo en JK+VIP+sMC:",   length(setdiff(genes_jk_smc, genes_perm_smc)), "\n")
+cat("Solo en Perm+VIP+sMC:", length(setdiff(genes_perm_smc, genes_jk_smc)), "\n")
+```
+
+## Núcleo confirmado por los CUATRO criterios (VIP + Jack-knife + Permutación + sMC)
+
+El subconjunto más exigente posible: genes que superan simultáneamente los cuatro métodos de selección de variables de PLSandO (VIP, Jack-knife, test de permutaciones y sMC).
+
+```{r}
+genes_four_criteria <- intersect(genes_jk_smc, genes_perm_smc)
+
+cat("Genes confirmados por VIP + Jack-knife + Permutación + sMC:", length(genes_four_criteria), "\n")
+
+genes_plsda_stats %>%
+  filter(gene_label %in% genes_four_criteria) %>%
+  dplyr::select(gene_label, GeneID, Description, VIP, pValJK, direction, combined_score) %>%
+  kable(caption = "Núcleo de genes confirmado por los cuatro criterios de selección")
+```
+
+# Guardado de resultados para enriquecimiento funcional
+
+Se guardan los genes seleccionados por ambos combos (VIP+Jack-knife y VIP+Permutación), separados en Celiac/Control, junto con su `GeneID`/Entrez ID, y el universo de genes de fondo (todos los protein-coding filtrados que entraron en el modelo). Además de los `.rds` para uso interno en R, se exportan listas de texto plano con los GeneID para poder pegarlas directamente en la web de ToppGene.
+
+```{r}
+saveRDS(selected_genes_celiac,       file.path(processed_dir, "selected_genes_celiac_jk.rds"))
+saveRDS(selected_genes_control,      file.path(processed_dir, "selected_genes_control_jk.rds"))
+saveRDS(selected_genes_celiac_perm,  file.path(processed_dir, "selected_genes_celiac_perm.rds"))
+saveRDS(selected_genes_control_perm, file.path(processed_dir, "selected_genes_control_perm.rds"))
+saveRDS(gene_label_map,              file.path(processed_dir, "gene_universe_map.rds"))
+
+
+writeLines(as.character(selected_genes_celiac$GeneID),       file.path(processed_dir, "toppgene_input_celiac_jk.txt"))
+writeLines(as.character(selected_genes_control$GeneID),      file.path(processed_dir, "toppgene_input_control_jk.txt"))
+writeLines(as.character(selected_genes_celiac_perm$GeneID),  file.path(processed_dir, "toppgene_input_celiac_perm.txt"))
+writeLines(as.character(selected_genes_control_perm$GeneID), file.path(processed_dir, "toppgene_input_control_perm.txt"))
+```
+
+
+

@@ -1,0 +1,1076 @@
+---
+title: "PLS2 — Relación bacterias-metabolitos — Leonard et al. (2021)"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+date: "2026-06-29"
+---
+
+Este script relaciona las bacterias (species) y los metabolitos identificados como `EC_specific` en el análisis de LMM, mediante PLS2.
+
+1. Selección de bacterias y metabolitos significativos en el LMM.
+2. PLS2 (X = bacterias, Y = metabolitos) con al menos 10 componentes.
+3. Selección del número definitivo de componentes.
+4. Gráficos de scores (coloreados por grupo/tiempo) y de loadings/weights, para identificar bacterias y metabolitos que actúan de forma coordinada.
+5. Significación de las relaciones bacteria-metabolito mediante los coeficientes de regresión del PLS2, comparando jackknife, permutación y VIP.
+6. Repetición del análisis por separado para casos y controles, para comprobar si la relación bacteria-metabolito cambia entre condiciones.
+
+# 1. Carga de datos y selección de variables EC-specific
+
+Se cargan las matrices transformadas (CLR para species, log para metabolitos) y las tablas de resultados del LMM. De estas últimas se extraen los nombres de las variables marcadas como `EC_specific`, que serán las variables de entrada (X) y salida (Y) del PLS.
+
+```{r}
+library(tidyverse)
+library(PLSandO)
+library(gridExtra)
+library(igraph)
+library(tidygraph)
+library(ggraph)
+library(here)
+
+processed_dir <- here("data", "processed", "leonard_2021")
+
+species_clr_data     <- readRDS(file.path(processed_dir, "species_clr_data.rds"))
+metabolites_log_data <- readRDS(file.path(processed_dir, "metabolites_log_data.rds"))
+
+species_lmm_results     <- readRDS(file.path(processed_dir, "species_lmm_results.rds"))
+metabolites_lmm_results <- readRDS(file.path(processed_dir, "metabolites_lmm_results.rds"))
+
+variables_species     <- species_lmm_results     %>% filter(EC_specific) %>% pull(variable)
+variables_metabolites <- metabolites_lmm_results %>% filter(EC_specific) %>% pull(variable)
+
+cat("Species EC-specific:    ", length(variables_species), "\n")
+cat("Metabolitos EC-specific: ", length(variables_metabolites), "\n")
+```
+
+# 2. Alineación de muestras entre species y metabolitos
+
+Las matrices de species y metabolitos no comparten necesariamente las mismas muestras exactas: al tratarse de dos ómicas distintas, es posible que en algún punto de tiempo se recogiera muestra para una técnica pero no para la otra. Se construye una clave única por muestra (`sujeto_tiempo_relativo`) y se conservan solo las muestras presentes en ambas matrices (`intersect`), ordenadas de forma idéntica para garantizar que cada fila de X se corresponda con la misma fila de Y.
+
+```{r}
+species_key     <- species_clr_data     %>% mutate(sample_key = paste(PaperID, relative_month, sep = "_"))
+metabolites_key <- metabolites_log_data %>% mutate(sample_key = paste(PaperID, relative_month, sep = "_"))
+
+common_keys <- intersect(species_key$sample_key, metabolites_key$sample_key)
+
+cat("Muestras species:     ", nrow(species_key), "\n")
+cat("Muestras metabolitos: ", nrow(metabolites_key), "\n")
+cat("Muestras comunes:     ", length(common_keys), "\n")
+
+species_aligned     <- species_key     %>% filter(sample_key %in% common_keys) %>% arrange(sample_key)
+metabolites_aligned <- metabolites_key %>% filter(sample_key %in% common_keys) %>% arrange(sample_key)
+
+identical(species_aligned$sample_key, metabolites_aligned$sample_key)
+```
+
+Se comprueban las muestras que no casan entre ambas matrices, para verificar que la pérdida de muestras (de 118 a 117) se debe a una diferencia real en el diseño de recogida (`Control_1` tiene muestras de metaboloma y de microbioma en puntos de tiempo distintos en el extremo más temprano de la ventana) y no a un error de construcción de la clave.
+
+```{r}
+setdiff(species_key$sample_key, metabolites_key$sample_key)
+setdiff(metabolites_key$sample_key, species_key$sample_key)
+```
+
+# 3. Construcción de las matrices X (species) e Y (metabolitos)
+
+```{r}
+X <- species_aligned     %>% select(all_of(variables_species))     %>% as.data.frame()
+Y <- metabolites_aligned %>% select(all_of(variables_metabolites)) %>% as.data.frame()
+
+rownames(X) <- species_aligned$sample_key
+rownames(Y) <- metabolites_aligned$sample_key
+
+cat("Filas X:", nrow(X), "| Columnas X:", ncol(X), "\n")
+cat("Filas Y:", nrow(Y), "| Columnas Y:", ncol(Y), "\n")
+```
+
+# 4. PLS2 — modelo conjunto (todas las muestras)
+
+## 4.1 Selección del número de componentes
+
+Se ajusta primero un modelo exploratorio con `ncomp = 10`, y se examina el gráfico R²/Q² por componente (equivalente, para PLS, al scree plot del PCA) para decidir el número definitivo de componentes.
+
+```{r}
+set.seed(123)
+
+modelo_pls2 <- pls(
+  x        = X,
+  y        = Y,
+  ncomp    = 10,
+  cvFolds  = 5,
+  rep      = 10,
+  perm     = 100,
+  scaling  = "standard",
+  scalingY = "standard",
+  algo     = "nipals",
+  train    = 1,
+  parallel = FALSE
+)
+
+modelo_pls2$summary
+```
+
+```{r}
+plsPlot(modelo_pls2, type = "R2vsQ2")
+```
+
+El codo se sitúa en la componente 4: hasta ahí cada componente aporta más de un 1% de R²Y individual, y a partir de la 5 la caída pasa a ser una meseta plana con ruido (incluso sube en algún punto posterior). Se fija `ncomp = 4` y se reajusta el modelo.
+
+```{r}
+set.seed(123)
+
+modelo_pls2 <- pls(
+  x        = X,
+  y        = Y,
+  ncomp    = 4,
+  cvFolds  = 5,
+  rep      = 10,
+  perm     = 100,
+  scaling  = "standard",
+  scalingY = "standard",
+  algo     = "nipals",
+  train    = 1,
+  parallel = FALSE
+)
+
+modelo_pls2$summary
+```
+
+## 4.2 Gráficos de scores
+
+Coloreados por grupo (caso/control) y por tiempo relativo (escala continua, paleta viridis) por separado, en vez de combinar color y forma en un mismo gráfico — con 7 niveles de tiempo, `ggplot2` no dispone de 7 formas de punto distintas por defecto y el resultado sale mal.
+
+```{r}
+covar_group <- data.frame(Group = species_aligned$group)
+covar_time  <- factor(species_aligned$relative_month,
+                      levels = c(-18, -15, -12, -9, -6, -3, 0))
+
+p1_group <- plsPlot(modelo_pls2, type = "scoresX", comp = 1:2,
+                     colBy = covar_group, labels = FALSE, ellipses = FALSE)
+
+
+p11_group <- plsPlot(modelo_pls2, type = "scoresX", comp = 3:4,
+                     colBy = covar_group, labels = FALSE, ellipses = FALSE)
+
+
+grid.arrange(p1_group, p11_group, ncol = 2)
+```
+
+```{r}
+p2_group <- plsPlot(modelo_pls2, type = "scoresY", comp = 1:2,
+                     colBy = covar_group, labels = FALSE, ellipses = FALSE)
+
+
+p21_group <- plsPlot(modelo_pls2, type = "scoresY", comp = 3:4,
+                     colBy = covar_group, labels = FALSE, ellipses = FALSE)
+
+
+grid.arrange(p2_group, p21_group, ncol = 2)
+```
+
+```{r}
+
+p1_time <- plsPlot(modelo_pls2, type = "scoresX", comp = 1:2,
+                    colBy = data.frame(relative_month = covar_time),
+                    labels = FALSE, ellipses = FALSE) +
+  scale_color_viridis_d(option = "viridis") +
+  guides(fill = "none", shape = "none")
+p11_time <- plsPlot(modelo_pls2, type = "scoresX", comp = 3:4,
+                    colBy = data.frame(relative_month = covar_time),
+                    labels = FALSE, ellipses = FALSE) +
+  scale_color_viridis_d(option = "viridis") +
+  guides(fill = "none", shape = "none")
+
+grid.arrange(p1_time, p11_time, ncol = 2)
+```
+
+
+```{r}
+
+p2_time <- plsPlot(modelo_pls2, type = "scoresY", comp = 1:2,
+                    colBy = data.frame(relative_month = covar_time),
+                    labels = FALSE, ellipses = FALSE) +
+  scale_color_viridis_d(option = "viridis") +
+  guides(fill = "none", shape = "none")
+p21_time <- plsPlot(modelo_pls2, type = "scoresY", comp = 3:4,
+                    colBy = data.frame(relative_month = covar_time),
+                    labels = FALSE, ellipses = FALSE) +
+  scale_color_viridis_d(option = "viridis") +
+  guides(fill = "none", shape = "none")
+
+grid.arrange(p2_time, p21_time, ncol = 2)
+```
+
+Ni grupo ni tiempo separan visiblemente las muestras en los dos primeros ejes, ni en el espacio X ni en el Y — coherente con los R²Y/Q² bajos ya observados.
+
+```{r}
+covar_country <- data.frame(Country = species_aligned$Country)
+p1_country <- plsPlot(modelo_pls2, type = "scoresX", comp = 1:2,
+                     colBy = covar_country, labels = FALSE, ellipses = FALSE)
+
+
+p11_country <- plsPlot(modelo_pls2, type = "scoresX", comp = 3:4,
+                     colBy = covar_country, labels = FALSE, ellipses = FALSE)
+
+
+grid.arrange(p1_country, p11_country, ncol = 2)
+```
+
+```{r}
+p2_country <- plsPlot(modelo_pls2, type = "scoresY", comp = 1:2,
+                     colBy = covar_country, labels = FALSE, ellipses = FALSE)
+
+
+p21_country <- plsPlot(modelo_pls2, type = "scoresY", comp = 3:4,
+                     colBy = covar_country, labels = FALSE, ellipses = FALSE)
+
+
+grid.arrange(p2_country, p21_country, ncol = 2)
+```
+
+
+```{r}
+covar_gender <- data.frame(Gender = species_aligned$Gender)
+p1_gender <- plsPlot(modelo_pls2, type = "scoresX", comp = 1:2,
+                     colBy = covar_gender, labels = FALSE, ellipses = FALSE)
+
+
+p11_gender <- plsPlot(modelo_pls2, type = "scoresX", comp = 3:4,
+                     colBy = covar_gender, labels = FALSE, ellipses = FALSE)
+
+
+grid.arrange(p1_gender, p11_gender, ncol = 2)
+```
+
+```{r}
+p2_gender <- plsPlot(modelo_pls2, type = "scoresY", comp = 1:2,
+                     colBy = covar_gender, labels = FALSE, ellipses = FALSE)
+
+
+p21_gender <- plsPlot(modelo_pls2, type = "scoresY", comp = 3:4,
+                     colBy = covar_gender, labels = FALSE, ellipses = FALSE)
+
+
+grid.arrange(p2_gender, p21_gender, ncol = 2)
+```
+
+```{r}
+covar_deliv <- data.frame(Delivery = species_aligned$Delivery_Mode)
+p1_deliv <- plsPlot(modelo_pls2, type = "scoresX", comp = 1:2,
+                     colBy = covar_deliv, labels = FALSE, ellipses = FALSE)
+
+
+p11_deliv <- plsPlot(modelo_pls2, type = "scoresX", comp = 3:4,
+                     colBy = covar_deliv, labels = FALSE, ellipses = FALSE)
+
+
+grid.arrange(p1_deliv, p11_deliv, ncol = 2)
+```
+
+```{r}
+p2_deliv <- plsPlot(modelo_pls2, type = "scoresY", comp = 1:2,
+                     colBy = covar_deliv, labels = FALSE, ellipses = FALSE)
+
+
+p21_deliv <- plsPlot(modelo_pls2, type = "scoresY", comp = 3:4,
+                     colBy = covar_deliv, labels = FALSE, ellipses = FALSE)
+
+
+grid.arrange(p2_deliv, p21_deliv, ncol = 2)
+```
+
+## 4.3 Gráficos de loadings
+
+Sirven para identificar bacterias y metabolitos que se comportan de forma coordinada (próximos entre sí en el espacio de componentes).
+
+```{r}
+p_loadX <- plsPlot(modelo_pls2, type = "loadingsX", comp = 1:2,
+                    shape = "point", labels = FALSE, repel = TRUE)
+p_loadY <- plsPlot(modelo_pls2, type = "loadingsY", comp = 1:2,
+                    shape = "point", labels = FALSE, repel = TRUE)
+
+grid.arrange(p_loadX, p_loadY, ncol = 2)
+```
+
+```{r, fig.width=11, fig.height=8}
+plsPlot(modelo_pls2, type = "loadingsX", comp = 1:2,
+        shape = "point", labels = TRUE, repel = TRUE)
+```
+
+```{r, fig.width=11, fig.height=8}
+plsPlot(modelo_pls2, type = "loadingsY", comp = 1:2,
+        shape = "point", labels = TRUE, repel = TRUE)
+```
+
+```{r}
+p_loadX1 <- plsPlot(modelo_pls2, type = "loadingsX", comp = 3:4,
+                    shape = "point", labels = FALSE, repel = TRUE)
+p_loadY1 <- plsPlot(modelo_pls2, type = "loadingsY", comp = 3:4,
+                    shape = "point", labels = FALSE, repel = TRUE)
+
+grid.arrange(p_loadX1, p_loadY1, ncol = 2)
+```
+
+```{r, fig.width=11, fig.height=8}
+plsPlot(modelo_pls2, type = "loadingsX", comp = 3:4,
+        shape = "point", labels = TRUE, repel = TRUE)
+```
+
+```{r, fig.width=11, fig.height=8}
+plsPlot(modelo_pls2, type = "loadingsY", comp = 3:4,
+        shape = "point", labels = TRUE, repel = TRUE)
+```
+
+Las bacterias se organizan en varias bandas a lo largo de Comp2, sugiriendo subgrupos con perfiles distintos. Los metabolitos, en cambio, quedan todos muy próximos entre sí en un mismo cuadrante — Comp1 y Comp2 están muy correlacionados en el espacio Y, sin subestructuras internas claras.
+
+## 4.4 Gráfico de weights
+
+Combina X e Y en el mismo espacio; es el que mejor refleja qué bacterias y metabolitos concretos se mueven juntos.
+
+```{r}
+plsPlot(modelo_pls2, type = "weights", comp = 1:2,
+        shape = "point", labels = FALSE, repel = TRUE)
+```
+
+
+```{r}
+plsPlot(modelo_pls2, type = "weights", comp = 3:4,
+        shape = "point", labels = FALSE, repel = TRUE)
+```
+
+Versión con etiquetas:
+
+```{r, fig.width=11, fig.height=8}
+plsPlot(modelo_pls2, type = "weights", comp = 1:2,
+        labels = TRUE, repel = TRUE, shape= 'point')
+```
+
+```{r, fig.width=11, fig.height=8}
+plsPlot(modelo_pls2, type = "weights", comp = 3:4,
+        labels = TRUE, repel = TRUE, shape= 'point')
+```
+
+## 4.5 Significación de las relaciones bacteria-metabolito
+
+Se usan los coeficientes de regresión del PLS2 (`plsVarSel()`), comparando tres criterios: jackknife, permutación y VIP. Con `Y` de más de una columna, jackknife y permutación devuelven una lista con una tabla por metabolito (bacterias significativas para ese metabolito en concreto); VIP da una única puntuación de importancia global por bacteria, no específica de metabolito.
+
+```{r, fig.width=16, fig.height=20, fig.show='hide'}
+set.seed(123)
+
+jack_result <- plsVarSel(modelo_pls2, type = "Jack", rep = 100, threshold = 0.05)
+perm_result <- plsVarSel(modelo_pls2, type = "Perm", rep = 100, threshold = 0.05)
+vip_result  <- plsVarSel(modelo_pls2, type = "VIP")
+```
+
+```{r}
+cat("Metabolitos con alguna bacteria significativa (Jack):", sum(sapply(jack_result, nrow) > 0), "\n")
+cat("Metabolitos con alguna bacteria significativa (Perm):", sum(sapply(perm_result, nrow) > 0), "\n")
+cat("Relaciones totales (Jack):", sum(sapply(jack_result, nrow)), "\n")
+cat("Relaciones totales (Perm):", sum(sapply(perm_result, nrow)), "\n")
+cat("Bacterias con VIP > 1:", nrow(vip_result), "\n")
+```
+
+**Nota importante**: el jackknife no detecta ninguna relación significativa (0 en las 21 tablas), muy probablemente por la multicolinealidad entre bacterias (varias se mueven en bandas coordinadas, como se vio en los loadings), que infla los errores estándar del jackknife. La permutación sí encuentra señal, y coincide con el VIP en la totalidad de los casos (ver más abajo) — se toma esta combinación (Perm + VIP) como criterio de selección final, dejando constancia de que el jackknife no la respalda.
+
+```{r}
+bacterias_perm <- perm_result %>%
+  discard(~ nrow(.x) == 0) %>%
+  map(rownames) %>%
+  unlist() %>%
+  unique()
+
+intersect(rownames(vip_result), bacterias_perm)
+```
+
+```{r}
+perm_no_vacios <- perm_result[sapply(perm_result, nrow) > 0]
+
+tabla_relaciones <- perm_no_vacios %>%
+  imap_dfr(~ tibble(
+    metabolito = .y,
+    bacteria   = rownames(.x),
+    p_perm     = .x$pValPerm
+  )) %>%
+  mutate(en_VIP = bacteria %in% rownames(vip_result)) %>%
+  mutate(coeficiente = modelo_pls2$coefficients[cbind(bacteria, metabolito)]) %>%
+  arrange(metabolito, p_perm)
+
+tabla_relaciones
+```
+
+18 relaciones entre 5 bacterias  y 9 metabolitos, todas respaldadas también por el VIP. 
+
+```{r}
+write_csv(tabla_relaciones, file.path(processed_dir, "relaciones_bacteria_metabolito_perm.csv"))
+```
+
+# 5. PLS2 separado por grupo (Case vs. Control)
+
+Se repite el análisis completo por separado para casos y controles, para comprobar si la relación bacteria-metabolito cambia entre condiciones — algo esperable, ya que las variables de entrada se seleccionaron precisamente por su interacción con el grupo en el LMM. Se mantiene la misma selección de variables (29 species, 21 metabolitos); lo único que cambia es el subconjunto de muestras sobre el que se ajusta cada modelo.
+
+## 5.1 División de las muestras por grupo
+
+```{r}
+species_case     <- species_aligned     %>% filter(group == "Case")
+species_control  <- species_aligned     %>% filter(group == "Control")
+
+metabolites_case    <- metabolites_aligned %>% filter(group == "Case")
+metabolites_control <- metabolites_aligned %>% filter(group == "Control")
+
+cat("Muestras Case:    ", nrow(species_case), "\n")
+cat("Muestras Control: ", nrow(species_control), "\n")
+```
+
+Confirmamos que species y metabolitos siguen alineados dentro de cada grupo
+
+```{r}
+identical(species_case$sample_key, metabolites_case$sample_key)
+identical(species_control$sample_key, metabolites_control$sample_key)
+```
+
+```{r}
+X_case <- species_case %>% select(all_of(variables_species)) %>% as.data.frame()
+Y_case <- metabolites_case %>% select(all_of(variables_metabolites)) %>% as.data.frame()
+rownames(X_case) <- species_case$sample_key
+rownames(Y_case) <- metabolites_case$sample_key
+
+X_control <- species_control %>% select(all_of(variables_species)) %>% as.data.frame()
+Y_control <- metabolites_control %>% select(all_of(variables_metabolites)) %>% as.data.frame()
+rownames(X_control) <- species_control$sample_key
+rownames(Y_control) <- metabolites_control$sample_key
+
+cat("Case:    X", dim(X_case), " Y", dim(Y_case), "\n")
+cat("Control: X", dim(X_control), " Y", dim(Y_control), "\n")
+```
+
+## 5.2 Selección del número de componentes (por grupo)
+
+```{r}
+set.seed(123)
+modelo_case <- pls(
+  x = X_case, y = Y_case, ncomp = 10,
+  cvFolds = 5, rep = 10, perm = 100,
+  scaling = "standard", scalingY = "standard",
+  algo = "nipals", train = 1, parallel = FALSE
+)
+
+set.seed(123)
+modelo_control <- pls(
+  x = X_control, y = Y_control, ncomp = 10,
+  cvFolds = 5, rep = 10, perm = 100,
+  scaling = "standard", scalingY = "standard",
+  algo = "nipals", train = 1, parallel = FALSE
+)
+
+modelo_case$summary
+```
+
+
+```{r}
+plsPlot(modelo_case, type = "R2vsQ2")
+```
+
+
+```{r}
+modelo_control$summary
+```
+
+```{r}
+plsPlot(modelo_control, type = "R2vsQ2")
+```
+
+En Case, aunque el criterio del codo por sí solo apuntaría a 4 componentes (cumR2Y = 40.1%), no se añade una componente si el R²Y ganado es pequeño y el Q² empeora sustancialmente. Al pasar de la componente 3 a la 4, la ganancia de R²Y individual cae a su valor más bajo de toda la serie (del 7.5% al 4.6%), mientras que el Q² individual empeora con fuerza (de −0.049 a −0.080, casi el doble de negativo) y el Q² acumulado pasa de −0.186 a −0.265. Se fija, por tanto, ncomp = 3 para Case (cumR2Y = 35.5%). En Control, la señal real se concentra en las dos primeras componentes (cumR2Y = 17.8%; la componente 2 explica más que la 1, lo cual no es un error — el PLS optimiza covarianza con X, no varianza de Y directamente), y a partir de la 3 el patrón se aplana en ruido. Se fija ncomp = 2 para Control.
+
+```{r}
+set.seed(123)
+modelo_case <- pls(
+  x = X_case, y = Y_case, ncomp = 3,
+  cvFolds = 5, rep = 10, perm = 100,
+  scaling = "standard", scalingY = "standard",
+  algo = "nipals", train = 1, parallel = FALSE
+)
+modelo_case$summary
+```
+
+```{r}
+set.seed(123)
+modelo_control <- pls(
+  x = X_control, y = Y_control, ncomp = 2,
+  cvFolds = 5, rep = 10, perm = 100,
+  scaling = "standard", scalingY = "standard",
+  algo = "nipals", train = 1, parallel = FALSE
+)
+modelo_control$summary
+```
+
+## 5.3 Gráficos exploratorios por grupo
+
+Como cada modelo contiene muestras de un único grupo, ya no tiene sentido colorear por grupo dentro de cada uno; se colorea solo por tiempo relativo.
+
+### 5.3.1 Gráficos exploratorios para grupo Case
+
+```{r}
+covar_time_case <- factor(species_case$relative_month,
+                           levels = c(-18, -15, -12, -9, -6, -3, 0))
+
+p1_case <- plsPlot(modelo_case, type = "scoresX", comp = 1:2,
+                    colBy = data.frame(relative_month = covar_time_case),
+                    labels = FALSE, ellipses = FALSE) +
+  scale_color_viridis_d(option = "viridis") +
+  guides(fill = "none", shape = "none")
+
+p11_case <- plsPlot(modelo_case, type = "scoresX", comp = 2:3,
+                    colBy = data.frame(relative_month = covar_time_case),
+                    labels = FALSE, ellipses = FALSE) +
+  scale_color_viridis_d(option = "viridis") +
+  guides(fill = "none", shape = "none")
+
+grid.arrange(p1_case, p11_case, ncol = 2)
+```
+
+
+```{r}
+p2_case <- plsPlot(modelo_case, type = "scoresY", comp = 1:2,
+                    colBy = data.frame(relative_month = covar_time_case),
+                    labels = FALSE, ellipses = FALSE) +
+  scale_color_viridis_d(option = "viridis") +
+  guides(fill = "none", shape = "none")
+
+p21_case <- plsPlot(modelo_case, type = "scoresY", comp = 2:3,
+                    colBy = data.frame(relative_month = covar_time_case),
+                    labels = FALSE, ellipses = FALSE) +
+  scale_color_viridis_d(option = "viridis") +
+  guides(fill = "none", shape = "none")
+
+grid.arrange(p2_case, p21_case, ncol = 2)
+```
+
+```{r}
+covar_deliv <- data.frame(Delivery = species_case$Delivery_Mode)
+p1_case_deliv <- plsPlot(modelo_case, type = "scoresX", comp = 1:2,
+                    colBy = covar_deliv,labels = FALSE, ellipses = FALSE)
+
+p11_case_deliv <- plsPlot(modelo_case, type = "scoresX", comp = 2:3,
+                    colBy = covar_deliv,
+                    labels = FALSE, ellipses = FALSE)
+grid.arrange(p1_case_deliv, p11_case_deliv, ncol = 2)
+```
+
+
+```{r}
+p2_case_deliv <- plsPlot(modelo_case, type = "scoresY", comp = 1:2,
+                    colBy = covar_deliv,labels = FALSE, ellipses = FALSE)
+
+p21_case_deliv <- plsPlot(modelo_case, type = "scoresY", comp = 2:3,
+                    colBy = covar_deliv,
+                    labels = FALSE, ellipses = FALSE)
+grid.arrange(p2_case_deliv, p21_case_deliv, ncol = 2)
+```
+
+```{r}
+covar_country <- data.frame(Country = species_case$Country)
+p1_case_country <- plsPlot(modelo_case, type = "scoresX", comp = 1:2,
+                    colBy = covar_country,labels = FALSE, ellipses = FALSE)
+
+p11_case_country <- plsPlot(modelo_case, type = "scoresX", comp = 2:3,
+                    colBy = covar_country,
+                    labels = FALSE, ellipses = FALSE)
+grid.arrange(p1_case_country, p11_case_country, ncol = 2)
+```
+
+
+```{r}
+p2_case_country <- plsPlot(modelo_case, type = "scoresY", comp = 1:2,
+                    colBy = covar_country,labels = FALSE, ellipses = FALSE)
+
+p21_case_country <- plsPlot(modelo_case, type = "scoresY", comp = 2:3,
+                    colBy = covar_country,
+                    labels = FALSE, ellipses = FALSE)
+grid.arrange(p2_case_country, p21_case_country, ncol = 2)
+```
+
+```{r}
+covar_gender <- data.frame(Gender = species_case$Gender)
+p1_case_gender <- plsPlot(modelo_case, type = "scoresX", comp = 1:2,
+                    colBy = covar_gender,labels = FALSE, ellipses = FALSE)
+
+p11_case_gender <- plsPlot(modelo_case, type = "scoresX", comp = 2:3,
+                    colBy = covar_gender,
+                    labels = FALSE, ellipses = FALSE)
+grid.arrange(p1_case_gender, p11_case_gender, ncol = 2)
+```
+
+
+```{r}
+p2_case_gender <- plsPlot(modelo_case, type = "scoresY", comp = 1:2,
+                    colBy = covar_gender,labels = FALSE, ellipses = FALSE)
+
+p21_case_gender <- plsPlot(modelo_case, type = "scoresY", comp = 2:3,
+                    colBy = covar_gender,
+                    labels = FALSE, ellipses = FALSE)
+grid.arrange(p2_case_gender, p21_case_gender, ncol = 2)
+```
+
+### 5.3.2 Gráficos exploratorios para grupo Control
+
+```{r}
+covar_time_control <- factor(species_control$relative_month,
+                              levels = c(-18, -15, -12, -9, -6, -3, 0))
+
+p1_control <- plsPlot(modelo_control, type = "scoresX", comp = 1:2,
+                       colBy = data.frame(relative_month = covar_time_control),
+                       labels = FALSE, ellipses = FALSE) +
+  scale_color_viridis_d(option = "viridis") +
+  guides(fill = "none", shape = "none")
+
+p2_control <- plsPlot(modelo_control, type = "scoresY", comp = 1:2,
+                       colBy = data.frame(relative_month = covar_time_control),
+                       labels = FALSE, ellipses = FALSE) +
+  scale_color_viridis_d(option = "viridis") +
+  guides(fill = "none", shape = "none")
+
+grid.arrange(p1_control, p2_control, ncol = 2)
+```
+
+
+```{r}
+covar_deliv <- data.frame(Delivery = species_control$Delivery_Mode)
+p1_control_deliv <- plsPlot(modelo_control, type = "scoresX", comp = 1:2,
+                    colBy = covar_deliv,labels = FALSE, ellipses = FALSE)
+
+p2_control_deliv <- plsPlot(modelo_control, type = "scoresY", comp = 1:2,
+                    colBy = covar_deliv,
+                    labels = FALSE, ellipses = FALSE)
+grid.arrange(p1_control_deliv, p2_control_deliv, ncol = 2)
+```
+
+```{r}
+covar_country <- data.frame(Country = species_control$Country)
+p1_control_country <- plsPlot(modelo_control, type = "scoresX", comp = 1:2,
+                    colBy = covar_country,labels = FALSE, ellipses = FALSE)
+
+p2_control_country <- plsPlot(modelo_control, type = "scoresY", comp = 1:2,
+                    colBy = covar_country,
+                    labels = FALSE, ellipses = FALSE)
+grid.arrange(p1_control_country, p2_control_country, ncol = 2)
+```
+
+```{r}
+covar_gender <- data.frame(Gender = species_control$Gender)
+p1_control_gender <- plsPlot(modelo_control, type = "scoresX", comp = 1:2,
+                    colBy = covar_gender,labels = FALSE, ellipses = FALSE)
+
+p2_control_gender <- plsPlot(modelo_control, type = "scoresY", comp = 1:2,
+                    colBy = covar_gender,
+                    labels = FALSE, ellipses = FALSE)
+grid.arrange(p1_control_gender, p2_control_gender, ncol = 2)
+```
+
+## 5.4 Loadings 
+
+### 5.4.1 Loadings case
+
+```{r}
+plsPlot(modelo_case, type = "loadingsX", comp = 1:2,
+                         shape = "point", labels = FALSE, repel = TRUE)
+```
+
+
+```{r, fig.width=11, fig.height=8}
+plsPlot(modelo_case, type = "loadingsX", comp = 1:2,
+        shape = "point", labels = TRUE, repel = TRUE)
+```
+
+
+```{r}
+plsPlot(modelo_case, type = "loadingsX", comp = 2:3,
+                         shape = "point", labels = FALSE, repel = TRUE)
+```
+
+```{r, fig.width=11, fig.height=8}
+plsPlot(modelo_case, type = "loadingsX", comp = 2:3,
+        shape = "point", labels = TRUE, repel = TRUE)
+```
+
+```{r}
+plsPlot(modelo_case, type = "loadingsY", comp = 1:2,
+                         shape = "point", labels = FALSE, repel = TRUE)
+```
+
+```{r, fig.width=11, fig.height=8}
+plsPlot(modelo_case, type = "loadingsY", comp = 1:2,
+        shape = "point", labels = TRUE, repel = TRUE)
+```
+
+```{r}
+plsPlot(modelo_case, type = "loadingsY", comp = 2:3,
+                         shape = "point", labels = FALSE, repel = TRUE)
+```
+
+```{r, fig.width=11, fig.height=8}
+plsPlot(modelo_case, type = "loadingsY", comp = 2:3,
+        shape = "point", labels = TRUE, repel = TRUE)
+```
+
+
+### 5.4.2 Loadings control
+
+
+```{r}
+plsPlot(modelo_control, type = "loadingsX", comp = 1:2,
+                            shape = "point", labels = FALSE, repel = TRUE)
+```
+
+```{r, fig.width=11, fig.height=8}
+plsPlot(modelo_control, type = "loadingsX", comp = 1:2,
+        shape = "point", labels = TRUE, repel = TRUE)
+```
+
+
+```{r}
+plsPlot(modelo_control, type = "loadingsY", comp = 1:2,
+                            shape = "point", labels = FALSE, repel = TRUE)
+```
+
+
+```{r, fig.width=11, fig.height=8}
+plsPlot(modelo_control, type = "loadingsY", comp = 1:2,
+        shape = "point", labels = TRUE, repel = TRUE)
+```
+
+## 5.5 Weights
+
+### 5.5.1 Weights case
+
+```{r}
+plsPlot(modelo_case, type = "weights", comp = 1:2, shape = "point",
+        labels = FALSE, repel = TRUE)
+```
+
+
+```{r}
+plsPlot(modelo_case, type = "weights", comp = 2:3, shape = "point",
+        labels = FALSE, repel = TRUE)
+```
+
+Versión con etiquetas:
+
+```{r, fig.width=11, fig.height=8}
+plsPlot(modelo_case, type = "weights", comp = 1:2,
+        labels = TRUE, repel = TRUE, shape='point')
+```
+
+```{r, fig.width=11, fig.height=8}
+plsPlot(modelo_case, type = "weights", comp = 2:3,
+        labels = TRUE, repel = TRUE, shape='point')
+```
+
+### 5.5.2 Weights control
+
+```{r}
+plsPlot(modelo_control, type = "weights", comp = 1:2, shape = "point",
+        labels = FALSE, repel = TRUE)
+```
+
+Versión con etiquetas:
+
+```{r, fig.width=11, fig.height=8}
+plsPlot(modelo_control, type = "weights", comp = 1:2,
+        labels = TRUE, repel = TRUE, shape='point')
+```
+
+## 5.6 Significación de relaciones bacteria-metabolito, por grupo
+
+```{r, fig.width=16, fig.height=20, fig.show='hide'}
+# Jackknife: análisis complementario
+set.seed(123)
+jack_case <- plsVarSel(
+  modelo_case,
+  type = "Jack",
+  rep = 100,
+  threshold = 0.05
+)
+
+set.seed(123)
+jack_control <- plsVarSel(
+  modelo_control,
+  type = "Jack",
+  rep = 100,
+  threshold = 0.05
+)
+
+# Permutación: criterio principal de selección de relaciones.
+# Se utilizan 1000 repeticiones para obtener una estimación más estable.
+set.seed(123)
+perm_case <- plsVarSel(
+  modelo_case,
+  type = "Perm",
+  rep = 1000,
+  threshold = 0.05
+)
+
+set.seed(123)
+perm_control <- plsVarSel(
+  modelo_control,
+  type = "Perm",
+  rep = 1000,
+  threshold = 0.05
+)
+
+# VIP: evidencia complementaria a nivel de bacteria, no criterio obligatorio
+vip_case <- plsVarSel(modelo_case, type = "VIP")
+vip_control <- plsVarSel(modelo_control, type = "VIP")
+
+cat(
+  "Case    - Jack:", sum(sapply(jack_case, nrow) > 0),
+  " Perm:", sum(sapply(perm_case, nrow) > 0),
+  " VIP:", nrow(vip_case), "\n"
+)
+
+cat(
+  "Control - Jack:", sum(sapply(jack_control, nrow) > 0),
+  " Perm:", sum(sapply(perm_control, nrow) > 0),
+  " VIP:", nrow(vip_control), "\n"
+)
+```
+
+Igual que en el modelo conjunto, el jackknife no encuentra relaciones significativas en ninguno de los dos grupos.
+
+```{r}
+tabla_case <- perm_case[sapply(perm_case, nrow) > 0] %>%
+  imap_dfr(~ tibble(
+    metabolito = .y,
+    bacteria   = rownames(.x),
+    p_perm     = .x$pValPerm
+  )) %>%
+  mutate(en_VIP = bacteria %in% rownames(vip_case)) %>%
+  mutate(coeficiente = modelo_case$coefficients[cbind(bacteria, metabolito)]) %>%
+  arrange(metabolito, p_perm)
+
+tabla_control <- perm_control[sapply(perm_control, nrow) > 0] %>%
+  imap_dfr(~ tibble(
+    metabolito = .y,
+    bacteria   = rownames(.x),
+    p_perm     = .x$pValPerm
+  )) %>%
+  mutate(en_VIP = bacteria %in% rownames(vip_control)) %>%
+  mutate(coeficiente = modelo_control$coefficients[cbind(bacteria, metabolito)]) %>%
+  arrange(metabolito, p_perm)
+
+tabla_case
+```
+
+
+```{r}
+tabla_control
+```
+
+```{r}
+write_csv(tabla_case,    file.path(processed_dir, "relaciones_bacteria_metabolito_case.csv"))
+write_csv(tabla_control, file.path(processed_dir, "relaciones_bacteria_metabolito_control.csv"))
+```
+
+## 5.7 Comparación Case vs. Control
+
+```{r}
+pares_case    <- paste(tabla_case$bacteria, tabla_case$metabolito, sep = "__")
+pares_control <- paste(tabla_control$bacteria, tabla_control$metabolito, sep = "__")
+
+cat("Relaciones solo en Case:   ", length(setdiff(pares_case, pares_control)), "\n")
+cat("Relaciones solo en Control:", length(setdiff(pares_control, pares_case)), "\n")
+cat("Relaciones en ambos:       ", length(intersect(pares_case, pares_control)), "\n")
+
+cat("\nBacterias en Case:   ", paste(sort(unique(tabla_case$bacteria)), collapse = ", "), "\n")
+cat("Bacterias en Control:", paste(sort(unique(tabla_control$bacteria)), collapse = ", "), "\n")
+```
+
+```{r}
+intersect(pares_case, pares_control)
+```
+
+### 5.7.1 Solapamiento con VIP dentro de cada grupo
+
+Se comprueba, para cada grupo por separado, qué proporción de las relaciones seleccionadas mediante permutación cuentan además con respaldo del VIP. El criterio principal para definir una relación candidata es la permutación ($p<0.05$); el VIP se utiliza únicamente como evidencia complementaria a nivel de bacteria.
+
+```{r}
+resumen_vip <- bind_rows(
+  tibble(
+    grupo = "Case",
+    relaciones = nrow(tabla_case),
+    con_VIP = sum(tabla_case$en_VIP),
+    porcentaje_VIP = 100 * mean(tabla_case$en_VIP)
+  ),
+  tibble(
+    grupo = "Control",
+    relaciones = nrow(tabla_control),
+    con_VIP = sum(tabla_control$en_VIP),
+    porcentaje_VIP = 100 * mean(tabla_control$en_VIP)
+  )
+)
+
+resumen_vip
+```
+
+También se examinan de forma específica las relaciones seleccionadas por permutación cuya bacteria no presenta VIP > 1:
+
+```{r}
+tabla_case %>% filter(!en_VIP)
+tabla_control %>% filter(!en_VIP)
+```
+
+# 6. Representación de las relaciones mediante grafos
+
+Se representan las relaciones bacteria-metabolito seleccionadas mediante permutación como grafos bipartitos: un nodo por bacteria, un nodo por metabolito, y una arista por cada relación significativa de la tabla correspondiente. Se usa `ggraph`/`tidygraph` (sobre `igraph`) en vez de `igraph` base, porque permite reposicionar automáticamente las etiquetas para evitar solapes (`ggrepel`), igual que ya se hace en los gráficos de loadings/weights del PLS — con `igraph` base, forzar manualmente ángulo y distancia de cada etiqueta no bastaba para evitar que varias se solaparan cuando hay muchos nodos en una misma fila.
+
+```{r}
+plot_bipartite_graph <- function(tabla, title, seed = 123) {
+  edges <- tabla %>% select(bacteria, metabolito)
+
+  g <- as_tbl_graph(graph_from_data_frame(edges, directed = FALSE)) %>%
+    activate(nodes) %>%
+    mutate(
+      type = name %in% unique(tabla$bacteria),      
+      tipo = if_else(type, "Bacteria", "Metabolito")
+    )
+
+  set.seed(seed)
+  ggraph(g, layout = "bipartite") +
+    geom_edge_link(color = "grey70", alpha = 0.6) +
+    geom_node_point(aes(color = tipo, shape = tipo), size = 5) +
+    geom_node_text(aes(label = name), repel = TRUE, size = 3.3,
+                    max.overlaps = Inf, seed = seed) +
+    scale_color_manual(values = c("Bacteria" = "#3182bd", "Metabolito" = "#31a354")) +
+    labs(title = title, color = NULL, shape = NULL) +
+    theme_void() +
+    theme(legend.position = "bottom", plot.title = element_text(hjust = 0.5))
+}
+```
+
+Alternativa para cuando el grafo conjunto tiene demasiadas relaciones para leerse bien: dividir la tabla en bloques (por ejemplo, de 20 relaciones) y graficar cada bloque por separado.
+
+```{r}
+plot_bipartite_graph_split <- function(tabla, title, block_size = 20, seed = 123) {
+  n_blocks <- ceiling(nrow(tabla) / block_size)
+  bloques <- split(tabla, ceiling(seq_len(nrow(tabla)) / block_size))
+
+  imap(bloques, function(sub_tabla, i) {
+    plot_bipartite_graph(sub_tabla, paste0(title, " (bloque ", i, "/", n_blocks, ")"), seed = seed)
+  })
+}
+```
+
+## 6.1 Grafo — modelo conjunto
+
+```{r, fig.width=11, fig.height=9}
+plot_bipartite_graph(tabla_relaciones, "Relaciones bacteria-metabolito — modelo conjunto")
+```
+
+### 6.1.0 Alternativa: división en bloques
+
+```{r, fig.width=11, fig.height=9}
+walk(plot_bipartite_graph_split(tabla_relaciones, "Relaciones — modelo conjunto", block_size = 20), print)
+```
+
+### 6.1.1 Alternativa: un subgrafo por bacteria
+
+Si el grafo conjunto resulta demasiado denso para leerse bien, esta es la alternativa: un panel pequeño por cada bacteria, mostrando solo sus metabolitos conectados. Al tener pocas conexiones cada uno (entre 2 y 10), no hay problema de solape de etiquetas.
+
+```{r}
+plot_star_by_bacteria <- function(tabla) {
+  bacterias <- sort(unique(tabla$bacteria))
+
+  plots <- map(bacterias, function(b) {
+    sub_tabla <- tabla %>% filter(bacteria == b)
+    edges <- sub_tabla %>% select(bacteria, metabolito)
+
+    g <- as_tbl_graph(graph_from_data_frame(edges, directed = FALSE)) %>%
+      activate(nodes) %>%
+      mutate(
+        type = name == b,
+        tipo = if_else(type, "Bacteria", "Metabolito")
+      )
+
+    ggraph(g, layout = "star") +
+      geom_edge_link(color = "grey70", alpha = 0.6) +
+      geom_node_point(aes(color = tipo, shape = tipo), size = 5) +
+      geom_node_text(aes(label = name), repel = TRUE, size = 4, max.overlaps = Inf) +
+      scale_color_manual(values = c("Bacteria" = "#3182bd", "Metabolito" = "#31a354")) +
+      labs(title = b) +
+      theme_void() +
+      theme(legend.position = "none", plot.title = element_text(size = 13, hjust = 0.5))
+  })
+
+  set_names(plots, bacterias)
+}
+```
+
+```{r, fig.width=7, fig.height=6}
+walk(plot_star_by_bacteria(tabla_relaciones), print)
+```
+
+## 6.2 Grafo — Case
+
+```{r, fig.width=11, fig.height=9}
+plot_bipartite_graph(tabla_case, "Relaciones bacteria-metabolito — Case")
+```
+
+```{r, fig.width=7, fig.height=6}
+walk(plot_star_by_bacteria(tabla_case), print)
+```
+
+## 6.3 Grafo — Control
+
+```{r, fig.width=11, fig.height=9}
+plot_bipartite_graph(tabla_control, "Relaciones bacteria-metabolito — Control")
+```
+
+```{r, fig.width=7, fig.height=6}
+walk(plot_star_by_bacteria(tabla_control), print)
+```
+
+# 7. Heatmaps bacteria-metabolito
+
+Alternativa a los grafos que no sufre el problema de solape de etiquetas: una matriz bacteria × metabolito coloreada por el coeficiente de regresión del PLS (extraído de `modelo_pls2$coefficients` / `modelo_case$coefficients` / `modelo_control$coefficients`), con azul para coeficientes negativos, rojo para positivos y blanco en 0.
+
+```{r}
+plot_heatmap_relaciones <- function(tabla, title) {
+  ggplot(tabla, aes(x = metabolito, y = bacteria, fill = coeficiente)) +
+    geom_tile(color = "grey30", linewidth = 0.6) +
+    scale_fill_gradient2(low = "#08519c", mid = "white", high = "#a50f15",
+                          midpoint = 0, name = "Coeficiente\nPLS") +
+    scale_x_discrete(expand = c(0, 0)) +
+    scale_y_discrete(expand = c(0, 0)) +
+    labs(title = title, x = NULL, y = NULL,
+         caption = "Celdas en gris: sin relación seleccionada mediante permutación") +
+    theme_minimal() +
+    theme(
+      panel.grid = element_blank(),
+      panel.background = element_rect(fill = "grey88", color = NA),
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 8, face = "bold"),
+      axis.text.y = element_text(size = 9, face = "bold"),
+      plot.title = element_text(hjust = 0.5),
+      plot.caption = element_text(size = 8, hjust = 0, color = "grey40")
+    )
+}
+```
+
+## 7.1 Heatmap — modelo conjunto
+
+```{r, fig.width=11, fig.height=6}
+plot_heatmap_relaciones(tabla_relaciones, "Relaciones bacteria-metabolito — modelo conjunto")
+```
+
+## 7.2 Heatmap — Case
+
+```{r, fig.width=11, fig.height=6}
+plot_heatmap_relaciones(tabla_case, "Relaciones bacteria-metabolito — Case")
+```
+
+## 7.3 Heatmap — Control
+
+```{r, fig.width=11, fig.height=6}
+plot_heatmap_relaciones(tabla_control, "Relaciones bacteria-metabolito — Control")
+```
+
+

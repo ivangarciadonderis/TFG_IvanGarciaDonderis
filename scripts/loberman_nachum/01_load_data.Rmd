@@ -1,0 +1,225 @@
+---
+title: "Carga de datos — Loberman-Nachum et al. (2019)"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+  pdf_document:
+    toc: true
+    toc_depth: '3'
+date: "2026-06-30"
+---
+
+Este script constituye el primer paso del análisis del paper Loberman-Nachum et al. (Scientific Reports, 2019). Su objetivo es leer los archivos descargados del repositorio público GEO (acceso GSE131705), construir la tabla de metadatos de las 54 muestras y preparar la matriz de conteos crudos de expresión génica para su procesamiento posterior.
+
+A diferencia de los papers anteriores, que trabajaban con datos de microbioma y metabolómica, este paper es de transcriptómica: mide la expresión de genes en biopsias duodenales de niños celíacos y controles mediante RNA-seq. Los datos están organizados en tres archivos: la matriz de conteos crudos (genes × muestras), el archivo de serie GEO con los metadatos de cada muestra, y el archivo de anotación génica que permite identificar cada gen por su símbolo y tipo biológico.
+
+# Carga de librerías y rutas
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(readxl)
+library(knitr)
+
+library(here)
+raw_dir       <- here("data", "raw", "loberman_nachum")
+processed_dir <- here("data", "processed", "loberman_nachum")
+
+dir.create(processed_dir, recursive = TRUE, showWarnings = FALSE)
+
+file_counts     <- file.path(raw_dir, "GSE131705_raw_counts_GRCh38.p13_NCBI.tsv")
+file_series     <- file.path(raw_dir, "GSE131705_series_matrix.txt")
+file_annotation <- file.path(raw_dir, "Human.GRCh38.p13.annot.tsv")
+```
+
+# Lectura y construcción de metadatos
+
+El archivo `series_matrix.txt` de GEO almacena los metadatos de cada muestra en líneas que comienzan por `!Sample_`. Se define una función auxiliar `get_geo_row()` que extrae los valores de una variable concreta a partir de su etiqueta, eliminando las comillas del formato GEO.
+
+```{r}
+series_lines <- readLines(file_series)
+
+get_geo_row <- function(pattern) {
+  line   <- series_lines[str_detect(series_lines, paste0("^", pattern, "\t"))][1]
+  values <- str_split(line, "\t")[[1]][-1]
+  values <- str_remove_all(values, '"')
+  return(values)
+}
+```
+
+Se extraen el título y el acceso GEO de cada muestra y se construye la tabla base de metadatos.
+
+```{r}
+sample_title <- get_geo_row("!Sample_title")
+sample_id    <- get_geo_row("!Sample_geo_accession")
+
+metadata <- tibble(
+  sample_id    = sample_id,
+  sample_title = sample_title
+)
+
+head(metadata)
+dim(metadata)
+```
+
+Las características clínicas de cada muestra están en líneas `!Sample_characteristics_ch1`. Se iteran todas esas líneas y se añade cada variable como columna nueva. Se corrige el error tipográfico "diagosis" del archivo original y se renombra "group" como "cohort" para evitar confusión con la variable diagnóstica.
+
+```{r}
+characteristics_lines <- series_lines[
+  str_detect(series_lines, "^!Sample_characteristics_ch1\t")
+]
+
+for (line in characteristics_lines) {
+  values         <- str_split(line, "\t")[[1]][-1]
+  values         <- str_remove_all(values, '"')
+  variable_name  <- str_extract(values[1], "^[^:]+")
+  variable_name  <- str_replace(variable_name, "diagosis", "diagnosis")
+  variable_name  <- str_replace(variable_name, "group", "cohort")
+  variable_values <- str_remove(values, "^[^:]+:\\s*")
+  metadata[[variable_name]] <- variable_values
+}
+
+glimpse(metadata)
+head(metadata)
+```
+
+Se aplican los tipos correctos a cada variable. La variable `group` se crea como factor con niveles Control y Celiac para usarla directamente en los modelos. La variable `cohort` recoge la asignación de cada muestra a la cohorte de entrenamiento o de validación tal como se definió en el paper original.
+
+```{r}
+metadata <- metadata %>%
+  mutate(
+    diagnosis = factor(diagnosis, levels = c("control", "celiac")),
+    group = factor(
+      if_else(diagnosis == "celiac", "Celiac", "Control"),
+      levels = c("Control", "Celiac")
+    ),
+    cohort         = factor(cohort, levels = c("training", "validation")),
+    age            = as.numeric(age),
+    gender         = factor(gender),
+    ttg_abnormal   = factor(ttg_abnormal),
+    ttg_over100    = as.integer(ttg_over100),
+    abdominal_pain = factor(abdominal_pain, levels = c("0", "1"),
+                            labels = c("No", "Yes")),
+    location       = factor(location)
+  )
+
+glimpse(metadata)
+```
+
+Se verifica la distribución de muestras por cohorte y grupo diagnóstico, que debe coincidir con la Tabla 1 del paper: 23 celíacos y 15 controles en training, 10 celíacos y 6 controles en validation.
+
+```{r}
+metadata %>%
+  count(cohort, group) %>%
+  kable(caption = "Distribución de muestras por cohorte y diagnóstico")
+```
+
+**Limitación**: el paper reporta que 48/54 muestras (89%) se procesaron dentro del primer año de almacenamiento y 6 (4 celíacas, 2 controles) se procesaron dentro de un plazo de hasta 4 años, y usa esta variable de tiempo de procesamiento como covariable de control en un PCA de sensibilidad (Figura S4). Esta variable **no está disponible** en los metadatos públicos del `series_matrix` de GEO (no existe ninguna columna de fecha/tiempo de procesamiento entre las características de muestra), por lo que no es posible reproducir ese análisis de sensibilidad en este TFG.
+
+# Lectura de la matriz de conteos crudos
+
+Los conteos crudos de RNA-seq están en formato genes × muestras. Cada fila es un gen identificado por su GeneID numérico de Entrez, y cada columna es una muestra identificada por su acceso GEO. Se reordenan las columnas para que coincidan exactamente con el orden de las muestras en la tabla de metadatos y se verifica que no haya discrepancias.
+
+```{r}
+raw_counts <- read_tsv(file_counts, show_col_types = FALSE)
+
+dim(raw_counts)
+head(raw_counts[, 1:6])
+```
+
+Se comprueba que todos los sample_id de metadata estén en la matriz de raw counts y viceversa.
+
+```{r}
+sample_cols_counts <- names(raw_counts)[-1]
+
+setdiff(metadata$sample_id, sample_cols_counts)
+setdiff(sample_cols_counts, metadata$sample_id)
+```
+Se fija el tipo de GeneID y se reordenan/filtran las columnas de muestra para que coincidan exactamente con el orden de metadata.
+
+```{r}
+raw_counts <- raw_counts %>%
+  mutate(GeneID = as.character(GeneID)) %>%
+  select(GeneID, all_of(metadata$sample_id))
+
+head(raw_counts[, 1:6])
+```
+
+# Lectura de la anotación génica
+
+El archivo de anotación del genoma humano GRCh38.p13 permite identificar cada GeneID numérico con su símbolo génico, descripción funcional y tipo de gen. Esta información se utilizará en el preprocesado para filtrar solo los genes que codifican proteínas, y en los análisis posteriores para interpretar los genes más relevantes.
+
+```{r}
+gene_annotation <- read_tsv(file_annotation, show_col_types = FALSE)
+
+dim(gene_annotation)
+head(gene_annotation[, 1:6])
+```
+
+```{r}
+gene_annotation <- gene_annotation %>%
+  mutate(GeneID = as.character(GeneID)) %>%
+  select(GeneID, Symbol, Description, GeneType, EnsemblGeneID)
+
+head(gene_annotation)
+```
+
+Se comprueba que `GeneID` es un identificador único (no debe haber duplicados, ya que es la clave del join con la matriz de conteos), y se comprueba también si hay `Symbol` repetidos, ya que en el preprocesado se sustituirán los GeneID numéricos por su símbolo génico y un símbolo duplicado impediría usarlo como identificador único.
+
+```{r}
+sum(duplicated(gene_annotation$GeneID))
+sum(duplicated(gene_annotation$Symbol, incomparables = NA))
+```
+
+```{r}
+gene_annotation %>%
+  filter(Symbol %in% Symbol[duplicated(Symbol)]) %>%
+  arrange(Symbol)
+```
+
+No hay `GeneID` duplicados. Sí aparecen 3 genes con el mismo `Symbol` (`TRNAV-CAC`), pero corresponden a variantes de un ARN de transferencia (`GeneType = "tRNA"`), no a genes codificantes de proteína. Como el filtrado de `preprocessing.Rmd` se restringe a genes protein-coding (siguiendo al paper, que usa 14,778 genes protein-coding), estos tres registros se eliminarán en ese paso y el problema de `Symbol` duplicado no afecta al conjunto final de genes analizados.
+
+Se verifica qué proporción de los genes en los conteos tiene símbolo génico anotado.
+
+```{r}
+raw_counts %>%
+  select(GeneID) %>%
+  left_join(gene_annotation, by = "GeneID") %>%
+  summarise(
+    n_genes               = n(),
+    genes_with_symbol     = sum(!is.na(Symbol)),
+    genes_without_symbol  = sum(is.na(Symbol))
+  ) %>%
+  kable(caption = "Cobertura de la anotación génica")
+```
+
+# Construcción de la matriz numérica y resumen
+
+```{r}
+counts_matrix <- raw_counts %>%
+  column_to_rownames("GeneID") %>%
+  as.matrix()
+
+dim(counts_matrix)
+counts_matrix[1:5, 1:5]
+```
+
+```{r}
+summary_load <- tibble(
+  object = c("metadata", "raw_counts", "counts_matrix", "gene_annotation"),
+  rows   = c(nrow(metadata), nrow(raw_counts), nrow(counts_matrix), nrow(gene_annotation)),
+  columns = c(ncol(metadata), ncol(raw_counts), ncol(counts_matrix), ncol(gene_annotation))
+)
+
+kable(summary_load, caption = "Resumen de objetos cargados")
+```
+
+# Guardado de datos
+
+```{r}
+saveRDS(metadata,       file.path(processed_dir, "metadata.rds"))
+saveRDS(raw_counts,     file.path(processed_dir, "raw_counts.rds"))
+saveRDS(counts_matrix,  file.path(processed_dir, "counts_matrix_gene_x_sample.rds"))
+saveRDS(gene_annotation, file.path(processed_dir, "gene_annotation.rds"))
+```

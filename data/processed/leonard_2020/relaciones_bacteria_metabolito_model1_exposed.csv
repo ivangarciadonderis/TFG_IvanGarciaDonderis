@@ -1,0 +1,9 @@
+metabolito,bacteria,p_perm,en_VIP,coeficiente
+Acetic.acid,Streptococcus_peroris,0.02,TRUE,-0.29936451250618185
+Acetic.acid,Bacteroides_uniformis,0.04,TRUE,-0.2850092418187058
+Arabinonic.acid,Bacteroides_uniformis,0.049,TRUE,-0.2718296765430768
+Butanedioic.acid,Streptococcus_peroris,0.03,TRUE,-0.2747985019085473
+Dihydroxyacetone,Bacteroides_uniformis,0.027,TRUE,-0.3188712463411838
+Galactaric.acid,Bacteroides_uniformis,0.019,TRUE,-0.24835954453304704
+Stearic.acid,Bacteroides_uniformis,0.032,TRUE,-0.2952816754993555
+Stearic.acid,Akkermansia_muciniphila,0.033,TRUE,0.2926383348120973

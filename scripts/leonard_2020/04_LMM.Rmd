@@ -1,0 +1,681 @@
+---
+title: "Modelos Lineales Mixtos (LMM) — Leonard et al. (2020)"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+date: "2026-07-04"
+---
+
+Este script ajusta dos modelos lineales mixtos por variable (especie, pathway o metabolito), siguiendo el mismo enfoque general que el LMM de Leonard et al. (2021), pero adaptado a las dos preguntas planteadas para este paper:
+
+- **Modelo 1 — Exposición ambiental**: efectos fijos tiempo, tiempo², exposición ambiental, e interacciones tiempo:exposición y tiempo²:exposición. Efecto aleatorio: sujeto. Se ajusta **solo en infantes genéticamente predispuestos** (`Genetic_Risk_Group != "Negative"`), replicando el alcance del análisis cross-sectional/longitudinal del paper original.
+- **Modelo 2 — Riesgo genético**: efectos fijos tiempo, tiempo², riesgo genético, e interacciones tiempo:riesgo y tiempo²:riesgo. Efecto aleatorio: sujeto. Se ajusta sobre los 31 sujetos.
+
+El tiempo se codifica numéricamente como `Enrollment = 0`, `3_months = 3`, `4_6_months = 5`, y se centra antes de elevarlo al cuadrado para evitar problemas de colinealidad/convergencia.
+
+# Carga de librerías y datos
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(lme4)      
+library(lmerTest)   
+library(knitr)      
+library(here)
+
+processed_dir <- here("data", "processed", "leonard_2020")
+
+species_clr_data     <- readRDS(file.path(processed_dir, "species_clr_data.rds"))
+pathways_clr_data    <- readRDS(file.path(processed_dir, "pathways_clr_data.rds"))
+metabolites_log_data <- readRDS(file.path(processed_dir, "metabolites_log_data.rds"))
+```
+
+#### Dimensiones de los datos cargados
+
+```{r}
+dim(species_clr_data)
+dim(pathways_clr_data)
+dim(metabolites_log_data)
+```
+
+# Separación de metadatos y matrices numéricas
+
+Cada objeto contiene metadatos y variables ómicas mezcladas. Se separan y, a diferencia de `PCA.Rmd` (donde se usa el CLR/log ya calculado sin reescalar), aquí cada matriz se reescala con `scale()` (media 0, desviación típica 1) porque el LMM se ajusta variable a variable: sin reescalar, las variables con mayor varianza absoluta tendrían estimaciones en escalas distintas y no serían comparables entre sí a la hora de interpretar los coeficientes.
+
+```{r}
+metadata_cols <- c(
+  "PaperID", "time_point", "country", "Delivery_Mode", "Gender",
+  "Genetic_Risk", "Feeding_Type",
+  "Maternal_antibiotics_during_Delivery",
+  "Infant_antibiotics_at_Birth",
+  "Infant_antibiotics_before_6mo",
+  "Antibiotics_Exposure_at_Birth",
+  "Exposure_to_Environmental_Factors",
+  "Genetic_Risk_Group",
+  "Enrollment_Sample", "Three_Month_Sample", "Four_Six_Month_Sample"
+)
+
+species_meta <- species_clr_data %>% select(any_of(metadata_cols))
+species_X_raw <- species_clr_data %>%
+  select(-any_of(metadata_cols)) %>%
+  mutate(across(everything(), as.numeric)) %>%
+  as.data.frame()
+rownames(species_X_raw) <- paste(species_meta$PaperID, species_meta$time_point, sep = "_")
+
+species_X_scaled <- as.data.frame(scale(species_X_raw))
+```
+
+```{r}
+pathways_meta <- pathways_clr_data %>% select(any_of(metadata_cols))
+pathways_X_raw <- pathways_clr_data %>%
+  select(-any_of(metadata_cols)) %>%
+  mutate(across(everything(), as.numeric)) %>%
+  as.data.frame()
+rownames(pathways_X_raw) <- paste(pathways_meta$PaperID, pathways_meta$time_point, sep = "_")
+
+pathways_X_scaled <- as.data.frame(scale(pathways_X_raw))
+```
+
+```{r}
+metabolites_meta <- metabolites_log_data %>% select(any_of(metadata_cols))
+metabolites_X_raw <- metabolites_log_data %>%
+  select(-any_of(metadata_cols)) %>%
+  mutate(across(everything(), as.numeric)) %>%
+  as.data.frame()
+rownames(metabolites_X_raw) <- paste(metabolites_meta$PaperID, metabolites_meta$time_point, sep = "_")
+
+metabolites_X_scaled <- as.data.frame(scale(metabolites_X_raw))
+```
+
+# Construcción de la variable de tiempo
+
+No existe en los metadatos una edad real por muestra, solo la etiqueta categórica `time_point`. Se codifica numéricamente según el diseño nominal del estudio (`Enrollment = 0`, `3_months = 3`, `4_6_months = 5`, el punto medio del rango 4-6) y se **centra** (`time_c`) antes de elevarla al cuadrado (`time_c2`). El centrado es una reparametrización pura — no cambia la interpretación biológica del modelo, pero reduce la colinealidad entre el término lineal y el cuadrático, lo que ayuda a la convergencia de `lmer`.
+
+```{r}
+add_time_vars <- function(meta) {
+  meta %>%
+    mutate(
+      time_num = case_when(
+        time_point == "Enrollment"  ~ 0,
+        time_point == "3_months"    ~ 3,
+        time_point == "4_6_months"  ~ 5
+      ),
+      time_c  = time_num - mean(time_num),
+      time_c2 = time_c^2
+    )
+}
+
+species_meta     <- add_time_vars(species_meta)
+pathways_meta    <- add_time_vars(pathways_meta)
+metabolites_meta <- add_time_vars(metabolites_meta)
+```
+
+# Función de ajuste del LMM
+
+Función genérica que recibe la variable respuesta (`y`, una columna de la matriz ómica ya escalada), los datos de efectos fijos/aleatorios, y la fórmula de efectos fijos como texto. Ajusta el `lmer` y devuelve una fila con las estimaciones y p-valores de todos los coeficientes en formato ancho (una columna `estimate_...` y `p_value_...` por término), para poder apilar los resultados de todas las variables con `map_dfr()`.
+
+Detalles de implementación:
+
+- `REML = TRUE`: es la opción correcta cuando se usa `lmerTest` para inferencia sobre efectos fijos (p-valores); `REML = FALSE` produciría p-valores sistemáticamente más pequeños y no es apropiado aquí.
+- `suppressWarnings()`: con grupos pequeños (`High` n=7, `Negative` n=5) es esperable que `lmer` avise de ajustes casi singulares en algunas variables. En vez de que esos avisos llenen la salida, se detectan explícitamente con `isSingular()` y se guardan en la columna `singular_fit`, para poder filtrarlos después de forma consciente en vez de que pasen desapercibidos entre cientos de warnings.
+- `str_remove_all("[()]")`: elimina los paréntesis del término `(Intercept)` para que el nombre de columna resultante sea válido y legible (`estimate_Intercept` en vez de `` estimate_(Intercept) ``).
+- `str_replace_all(":", "_")`: sustituye los dos puntos de los términos de interacción (p. ej. `time_c:Genetic_Risk_GroupHigh`) por guion bajo, para poder referenciar esas columnas más adelante sin necesidad de comillas invertidas.
+
+```{r}
+tidy_lmm <- function(y, data, formula_rhs) {
+  data$y <- y
+  f <- as.formula(paste("y ~", formula_rhs))
+
+  model <- suppressWarnings(
+    lmer(f, data = data, REML = TRUE)
+  )
+
+  coefs <- as.data.frame(summary(model)$coefficients)
+  coefs$term <- rownames(coefs)
+
+  coefs <- coefs %>%
+    rename(estimate = Estimate, p_value = `Pr(>|t|)`) %>%
+    mutate(term = term %>%
+             str_remove_all("[()]") %>%
+             str_replace_all(":", "_")) %>%
+    select(term, estimate, p_value)
+
+  wide <- coefs %>%
+    pivot_wider(names_from = term, values_from = c(estimate, p_value), names_glue = "{.value}_{term}")
+
+  wide$singular_fit <- isSingular(model)
+  wide
+}
+```
+
+```{r}
+model1_formula <- "time_c + time_c2 + Exposure_to_Environmental_Factors + time_c:Exposure_to_Environmental_Factors + time_c2:Exposure_to_Environmental_Factors + (1 | PaperID)"
+
+model2_formula <- "time_c + time_c2 + Genetic_Risk_Group + time_c:Genetic_Risk_Group + time_c2:Genetic_Risk_Group + (1 | PaperID)"
+```
+
+---
+
+# Modelo 1 — Exposición ambiental
+
+Se filtra a los infantes genéticamente predispuestos (`Genetic_Risk_Group != "Negative"`, 26 de 31 sujetos), igual que el alcance del análisis cross-sectional/longitudinal del paper.
+
+```{r}
+species_model1_idx     <- which(species_meta$Genetic_Risk_Group != "Negative")
+pathways_model1_idx    <- which(pathways_meta$Genetic_Risk_Group != "Negative")
+metabolites_model1_idx <- which(metabolites_meta$Genetic_Risk_Group != "Negative")
+
+species_model1_data <- species_meta[species_model1_idx, ] %>%
+  select(PaperID, time_c, time_c2, Exposure_to_Environmental_Factors)
+species_model1_X <- species_X_scaled[species_model1_idx, ]
+
+pathways_model1_data <- pathways_meta[pathways_model1_idx, ] %>%
+  select(PaperID, time_c, time_c2, Exposure_to_Environmental_Factors)
+pathways_model1_X <- pathways_X_scaled[pathways_model1_idx, ]
+
+metabolites_model1_data <- metabolites_meta[metabolites_model1_idx, ] %>%
+  select(PaperID, time_c, time_c2, Exposure_to_Environmental_Factors)
+metabolites_model1_X <- metabolites_X_scaled[metabolites_model1_idx, ]
+```
+
+#### Dimensiones tras filtrado — Modelo 1
+
+```{r}
+dim(species_model1_data)
+dim(pathways_model1_data)
+dim(metabolites_model1_data)
+```
+
+## Ajuste — Species
+
+Se ajusta un `lmer` por especie (una columna de `species_model1_X` a la vez) con `map_dfr()`, y se apilan los resultados en una única tabla con una fila por especie.
+
+```{r}
+species_model1_results <- map_dfr(
+  names(species_model1_X),
+  function(var_name) {
+    result <- tidy_lmm(species_model1_X[[var_name]], species_model1_data, model1_formula)
+    result$variable <- var_name
+    result
+  }
+) %>%
+  relocate(variable)
+```
+
+#### Dimensiones del ajuste — Species (Modelo 1)
+
+```{r}
+dim(species_model1_results)
+```
+
+#### Especies con ajuste singular — Modelo 1
+
+Ajustes singulares indican que la varianza del efecto aleatorio de sujeto se estimó en (o muy cerca de) cero; no invalidan las estimaciones de efectos fijos, pero conviene tratarlos con cautela.
+
+```{r}
+species_model1_results %>% filter(singular_fit) %>% pull(variable)
+```
+
+## Ajuste — Pathways
+
+```{r}
+pathways_model1_results <- map_dfr(
+  names(pathways_model1_X),
+  function(var_name) {
+    result <- tidy_lmm(pathways_model1_X[[var_name]], pathways_model1_data, model1_formula)
+    result$variable <- var_name
+    result
+  }
+) %>%
+  relocate(variable)
+```
+
+#### Dimensiones del ajuste — Pathways (Modelo 1)
+
+```{r}
+dim(pathways_model1_results)
+```
+
+#### Pathways con ajuste singular — Modelo 1
+
+```{r}
+pathways_model1_results %>% filter(singular_fit) %>% pull(variable)
+```
+
+## Ajuste — Metabolites
+
+```{r}
+metabolites_model1_results <- map_dfr(
+  names(metabolites_model1_X),
+  function(var_name) {
+    result <- tidy_lmm(metabolites_model1_X[[var_name]], metabolites_model1_data, model1_formula)
+    result$variable <- var_name
+    result
+  }
+) %>%
+  relocate(variable)
+```
+
+#### Dimensiones del ajuste — Metabolites (Modelo 1)
+
+```{r}
+dim(metabolites_model1_results)
+```
+
+#### Metabolitos con ajuste singular — Modelo 1
+
+```{r}
+metabolites_model1_results %>% filter(singular_fit) %>% pull(variable)
+```
+
+## Selección de variables relevantes para EC — Modelo 1
+
+**Criterio**: se marca `EC_specific = TRUE` cuando `exposición` (efecto principal), `tiempo:exposición` **o** `tiempo²:exposición` es significativo (p < 0.05).
+
+**Justificación general**: cada uno de estos 3 coeficientes representa una forma distinta en la que la exposición ambiental puede asociarse a una variable — como diferencia constante entre expuestos y no-expuestos (efecto principal), o como diferencia que cambia con el tiempo (las dos interacciones). Cualquiera de las tres es evidencia de que la exposición ambiental está relacionada con esa variable, así que se considera relevante si se cumple **al menos una** de ellas, sin exigir que se cumplan todas a la vez.
+
+
+```{r}
+species_model1_results <- species_model1_results %>%
+  mutate(EC_specific =
+    p_value_Exposure_to_Environmental_FactorsExposed          < 0.05 |
+    p_value_time_c_Exposure_to_Environmental_FactorsExposed   < 0.05 |
+    p_value_time_c2_Exposure_to_Environmental_FactorsExposed  < 0.05
+  )
+
+pathways_model1_results <- pathways_model1_results %>%
+  mutate(EC_specific =
+    p_value_Exposure_to_Environmental_FactorsExposed          < 0.05 |
+    p_value_time_c_Exposure_to_Environmental_FactorsExposed   < 0.05 |
+    p_value_time_c2_Exposure_to_Environmental_FactorsExposed  < 0.05
+  )
+
+metabolites_model1_results <- metabolites_model1_results %>%
+  mutate(EC_specific =
+    p_value_Exposure_to_Environmental_FactorsExposed          < 0.05 |
+    p_value_time_c_Exposure_to_Environmental_FactorsExposed   < 0.05 |
+    p_value_time_c2_Exposure_to_Environmental_FactorsExposed  < 0.05
+  )
+```
+
+#### Variables EC-specific con ajuste singular — Modelo 1
+
+Intersección entre relevancia EC y ajuste singular: estas variables aparecen como significativas pero su estimación de varianza aleatoria es inestable, así que conviene revisarlas con cautela adicional.
+
+```{r}
+species_model1_results     %>% filter(EC_specific, singular_fit) %>% pull(variable)
+pathways_model1_results    %>% filter(EC_specific, singular_fit) %>% pull(variable)
+metabolites_model1_results %>% filter(EC_specific, singular_fit) %>% pull(variable)
+```
+
+### Variables significativas por coeficiente — Modelo 1
+
+Función auxiliar para extraer, de una tabla de resultados, las variables significativas para un coeficiente concreto, ordenadas por p-valor.
+
+```{r}
+show_significant <- function(df, p_col, label) {
+  df %>%
+    filter(.data[[p_col]] < 0.05) %>%
+    select(variable, estimate = paste0("estimate_", str_remove(p_col, "^p_value_")), p_value = all_of(p_col)) %>%
+    arrange(p_value) %>%
+    mutate(coeficiente = label, .before = 1)
+}
+```
+
+**Species**
+
+#### Efecto principal — Exposición ambiental (Species)
+
+```{r}
+kable(show_significant(species_model1_results, "p_value_Exposure_to_Environmental_FactorsExposed", "exposición"))
+```
+
+#### Interacción tiempo:exposición (Species)
+
+```{r}
+kable(show_significant(species_model1_results, "p_value_time_c_Exposure_to_Environmental_FactorsExposed", "tiempo:exposición"))
+```
+
+#### Interacción tiempo²:exposición (Species)
+
+```{r}
+kable(show_significant(species_model1_results, "p_value_time_c2_Exposure_to_Environmental_FactorsExposed", "tiempo²:exposición"))
+```
+
+**Pathways**
+
+#### Efecto principal — Exposición ambiental (Pathways)
+
+```{r}
+kable(show_significant(pathways_model1_results, "p_value_Exposure_to_Environmental_FactorsExposed", "exposición"))
+```
+
+#### Interacción tiempo:exposición (Pathways)
+
+```{r}
+kable(show_significant(pathways_model1_results, "p_value_time_c_Exposure_to_Environmental_FactorsExposed", "tiempo:exposición"))
+```
+
+#### Interacción tiempo²:exposición (Pathways)
+
+```{r}
+kable(show_significant(pathways_model1_results, "p_value_time_c2_Exposure_to_Environmental_FactorsExposed", "tiempo²:exposición"))
+```
+
+**Metabolites**
+
+#### Efecto principal — Exposición ambiental (Metabolites)
+
+```{r}
+kable(show_significant(metabolites_model1_results, "p_value_Exposure_to_Environmental_FactorsExposed", "exposición"))
+```
+
+#### Interacción tiempo:exposición (Metabolites)
+
+```{r}
+kable(show_significant(metabolites_model1_results, "p_value_time_c_Exposure_to_Environmental_FactorsExposed", "tiempo:exposición"))
+```
+
+#### Interacción tiempo²:exposición (Metabolites)
+
+```{r}
+kable(show_significant(metabolites_model1_results, "p_value_time_c2_Exposure_to_Environmental_FactorsExposed", "tiempo²:exposición"))
+```
+
+---
+
+# Modelo 2 — Riesgo genético
+
+Se usan los 31 sujetos, con `Negative` como nivel de referencia (sin predisposición genética).
+
+## Ajuste — Species
+
+```{r}
+species_model2_data <- species_meta %>%
+  select(PaperID, time_c, time_c2, Genetic_Risk_Group)
+
+species_model2_results <- map_dfr(
+  names(species_X_scaled),
+  function(var_name) {
+    result <- tidy_lmm(species_X_scaled[[var_name]], species_model2_data, model2_formula)
+    result$variable <- var_name
+    result
+  }
+) %>%
+  relocate(variable)
+```
+
+#### Dimensiones del ajuste — Species (Modelo 2)
+
+```{r}
+dim(species_model2_results)
+```
+
+#### Especies con ajuste singular — Modelo 2
+
+```{r}
+species_model2_results %>% filter(singular_fit) %>% pull(variable)
+```
+
+## Ajuste — Pathways
+
+```{r}
+pathways_model2_data <- pathways_meta %>%
+  select(PaperID, time_c, time_c2, Genetic_Risk_Group)
+
+pathways_model2_results <- map_dfr(
+  names(pathways_X_scaled),
+  function(var_name) {
+    result <- tidy_lmm(pathways_X_scaled[[var_name]], pathways_model2_data, model2_formula)
+    result$variable <- var_name
+    result
+  }
+) %>%
+  relocate(variable)
+```
+
+#### Dimensiones del ajuste — Pathways (Modelo 2)
+
+```{r}
+dim(pathways_model2_results)
+```
+
+#### Pathways con ajuste singular — Modelo 2
+
+```{r}
+pathways_model2_results %>% filter(singular_fit) %>% pull(variable)
+```
+
+## Ajuste — Metabolites
+
+```{r}
+metabolites_model2_data <- metabolites_meta %>%
+  select(PaperID, time_c, time_c2, Genetic_Risk_Group)
+
+metabolites_model2_results <- map_dfr(
+  names(metabolites_X_scaled),
+  function(var_name) {
+    result <- tidy_lmm(metabolites_X_scaled[[var_name]], metabolites_model2_data, model2_formula)
+    result$variable <- var_name
+    result
+  }
+) %>%
+  relocate(variable)
+```
+
+#### Dimensiones del ajuste — Metabolites (Modelo 2)
+
+```{r}
+dim(metabolites_model2_results)
+```
+
+#### Metabolitos con ajuste singular — Modelo 2
+
+```{r}
+metabolites_model2_results %>% filter(singular_fit) %>% pull(variable)
+```
+
+## Selección de variables relevantes para EC — Modelo 2
+
+**Criterio**: se marca `EC_specific = TRUE` cuando **cualquiera** de los 6 términos de riesgo genético es significativo (p < 0.05): `Genetic_Risk_GroupHigh`, `tiempo:Genetic_Risk_GroupHigh`, `tiempo²:Genetic_Risk_GroupHigh`, `Genetic_Risk_GroupStandard`, `tiempo:Genetic_Risk_GroupStandard` o `tiempo²:Genetic_Risk_GroupStandard`.
+
+**Justificación general**: igual que en el Modelo 1, cada coeficiente representa una forma distinta en la que un nivel de riesgo genético puede asociarse a una variable — como diferencia constante frente al grupo de referencia (efecto principal), o como diferencia que cambia con el tiempo (las dos interacciones). Se considera relevante si se cumple **al menos una** de las seis.
+
+**Por qué se incluye también `Standard`**: el paper original no excluye ni infravalora este grupo — lo modelan como un nivel de riesgo genético igual de válido que `High` (mismas figuras, mismo diseño MaAsLin con "No genetic risk" como referencia única para ambos), y reportan hallazgos significativos específicos de `Standard` en especies. Siguiendo ese mismo criterio, no hay razón para ser más restrictivos que el propio paper y dejar fuera esta señal.
+
+
+```{r}
+species_model2_results <- species_model2_results %>%
+  mutate(EC_specific =
+    p_value_Genetic_Risk_GroupHigh            < 0.05 |
+    p_value_time_c_Genetic_Risk_GroupHigh      < 0.05 |
+    p_value_time_c2_Genetic_Risk_GroupHigh     < 0.05 |
+    p_value_Genetic_Risk_GroupStandard         < 0.05 |
+    p_value_time_c_Genetic_Risk_GroupStandard  < 0.05 |
+    p_value_time_c2_Genetic_Risk_GroupStandard < 0.05
+  )
+
+pathways_model2_results <- pathways_model2_results %>%
+  mutate(EC_specific =
+    p_value_Genetic_Risk_GroupHigh            < 0.05 |
+    p_value_time_c_Genetic_Risk_GroupHigh      < 0.05 |
+    p_value_time_c2_Genetic_Risk_GroupHigh     < 0.05 |
+    p_value_Genetic_Risk_GroupStandard         < 0.05 |
+    p_value_time_c_Genetic_Risk_GroupStandard  < 0.05 |
+    p_value_time_c2_Genetic_Risk_GroupStandard < 0.05
+  )
+
+metabolites_model2_results <- metabolites_model2_results %>%
+  mutate(EC_specific =
+    p_value_Genetic_Risk_GroupHigh            < 0.05 |
+    p_value_time_c_Genetic_Risk_GroupHigh      < 0.05 |
+    p_value_time_c2_Genetic_Risk_GroupHigh     < 0.05 |
+    p_value_Genetic_Risk_GroupStandard         < 0.05 |
+    p_value_time_c_Genetic_Risk_GroupStandard  < 0.05 |
+    p_value_time_c2_Genetic_Risk_GroupStandard < 0.05
+  )
+```
+
+#### Variables EC-specific con ajuste singular — Modelo 2
+
+Con grupos pequeños (`High` n=7, `Negative` n=5) es esperable un número no trivial de ajustes singulares entre las variables EC-specific.
+
+```{r}
+species_model2_results     %>% filter(EC_specific, singular_fit) %>% pull(variable)
+pathways_model2_results    %>% filter(EC_specific, singular_fit) %>% pull(variable)
+metabolites_model2_results %>% filter(EC_specific, singular_fit) %>% pull(variable)
+```
+
+### Variables significativas por coeficiente — Modelo 2
+
+**Species**
+
+#### Efecto principal — Riesgo genético High (Species)
+
+```{r}
+kable(show_significant(species_model2_results, "p_value_Genetic_Risk_GroupHigh", "riesgo_High"))
+```
+
+#### Interacción tiempo:riesgo_High (Species)
+
+```{r}
+kable(show_significant(species_model2_results, "p_value_time_c_Genetic_Risk_GroupHigh", "tiempo:riesgo_High"))
+```
+
+#### Interacción tiempo²:riesgo_High (Species)
+
+```{r}
+kable(show_significant(species_model2_results, "p_value_time_c2_Genetic_Risk_GroupHigh", "tiempo²:riesgo_High"))
+```
+
+#### Efecto principal — Riesgo genético Standard (Species)
+
+```{r}
+kable(show_significant(species_model2_results, "p_value_Genetic_Risk_GroupStandard", "riesgo_Standard"))
+```
+
+#### Interacción tiempo:riesgo_Standard (Species)
+
+```{r}
+kable(show_significant(species_model2_results, "p_value_time_c_Genetic_Risk_GroupStandard", "tiempo:riesgo_Standard"))
+```
+
+#### Interacción tiempo²:riesgo_Standard (Species)
+
+```{r}
+kable(show_significant(species_model2_results, "p_value_time_c2_Genetic_Risk_GroupStandard", "tiempo²:riesgo_Standard"))
+```
+
+**Pathways**
+
+#### Efecto principal — Riesgo genético High (Pathways)
+
+```{r}
+kable(show_significant(pathways_model2_results, "p_value_Genetic_Risk_GroupHigh", "riesgo_High"))
+```
+
+#### Interacción tiempo:riesgo_High (Pathways)
+
+```{r}
+kable(show_significant(pathways_model2_results, "p_value_time_c_Genetic_Risk_GroupHigh", "tiempo:riesgo_High"))
+```
+
+#### Interacción tiempo²:riesgo_High (Pathways)
+
+```{r}
+kable(show_significant(pathways_model2_results, "p_value_time_c2_Genetic_Risk_GroupHigh", "tiempo²:riesgo_High"))
+```
+
+#### Efecto principal — Riesgo genético Standard (Pathways)
+
+```{r}
+kable(show_significant(pathways_model2_results, "p_value_Genetic_Risk_GroupStandard", "riesgo_Standard"))
+```
+
+#### Interacción tiempo:riesgo_Standard (Pathways)
+
+```{r}
+kable(show_significant(pathways_model2_results, "p_value_time_c_Genetic_Risk_GroupStandard", "tiempo:riesgo_Standard"))
+```
+
+#### Interacción tiempo²:riesgo_Standard (Pathways)
+
+```{r}
+kable(show_significant(pathways_model2_results, "p_value_time_c2_Genetic_Risk_GroupStandard", "tiempo²:riesgo_Standard"))
+```
+
+
+
+**Metabolites**
+
+#### Efecto principal — Riesgo genético High (Metabolites)
+
+```{r}
+kable(show_significant(metabolites_model2_results, "p_value_Genetic_Risk_GroupHigh", "riesgo_High"))
+```
+
+#### Interacción tiempo:riesgo_High (Metabolites)
+
+```{r}
+kable(show_significant(metabolites_model2_results, "p_value_time_c_Genetic_Risk_GroupHigh", "tiempo:riesgo_High"))
+```
+
+#### Interacción tiempo²:riesgo_High (Metabolites)
+
+```{r}
+kable(show_significant(metabolites_model2_results, "p_value_time_c2_Genetic_Risk_GroupHigh", "tiempo²:riesgo_High"))
+```
+
+#### Efecto principal — Riesgo genético Standard (Metabolites)
+
+```{r}
+kable(show_significant(metabolites_model2_results, "p_value_Genetic_Risk_GroupStandard", "riesgo_Standard"))
+```
+
+#### Interacción tiempo:riesgo_Standard (Metabolites)
+
+```{r}
+kable(show_significant(metabolites_model2_results, "p_value_time_c_Genetic_Risk_GroupStandard", "tiempo:riesgo_Standard"))
+```
+
+#### Interacción tiempo²:riesgo_Standard (Metabolites)
+
+```{r}
+kable(show_significant(metabolites_model2_results, "p_value_time_c2_Genetic_Risk_GroupStandard", "tiempo²:riesgo_Standard"))
+```
+
+---
+
+# Resumen — variables consideradas relevantes para EC
+
+Número de especies, pathways y metabolitos marcados como `EC_specific = TRUE` en cada modelo, antes de guardar los resultados.
+
+```{r}
+resumen_EC_specific <- tibble(
+  omica = rep(c("Species", "Pathways", "Metabolites"), times = 2),
+  modelo = rep(c("Modelo 1 (exposición ambiental)", "Modelo 2 (riesgo genético)"), each = 3),
+  n_EC_specific = c(
+    sum(species_model1_results$EC_specific),
+    sum(pathways_model1_results$EC_specific),
+    sum(metabolites_model1_results$EC_specific),
+    sum(species_model2_results$EC_specific),
+    sum(pathways_model2_results$EC_specific),
+    sum(metabolites_model2_results$EC_specific)
+  )
+)
+
+kable(resumen_EC_specific)
+```
+
+# Guardado de resultados
+
+```{r}
+saveRDS(species_model1_results,     file.path(processed_dir, "species_model1_lmm_results.rds"))
+saveRDS(pathways_model1_results,    file.path(processed_dir, "pathways_model1_lmm_results.rds"))
+saveRDS(metabolites_model1_results, file.path(processed_dir, "metabolites_model1_lmm_results.rds"))
+
+saveRDS(species_model2_results,     file.path(processed_dir, "species_model2_lmm_results.rds"))
+saveRDS(pathways_model2_results,    file.path(processed_dir, "pathways_model2_lmm_results.rds"))
+saveRDS(metabolites_model2_results, file.path(processed_dir, "metabolites_model2_lmm_results.rds"))
+```

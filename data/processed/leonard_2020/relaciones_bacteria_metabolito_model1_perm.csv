@@ -1,0 +1,16 @@
+metabolito,bacteria,p_perm,en_VIP,coeficiente
+Acetic.acid,Bacteroides_uniformis,0.046,TRUE,-0.18453888197032384
+Acetic.acid,Streptococcus_peroris,0.046,TRUE,-0.18948877409619874
+Arabinonic.acid,Bacteroides_uniformis,0.016,TRUE,-0.22449425273722226
+Arabinonic.acid,Streptococcus_peroris,0.028,TRUE,-0.20848183315481184
+Arabinonic.acid,Bacteroides_fragilis,0.044,TRUE,0.20121696750444953
+Dihydroxyacetone,Bacteroides_uniformis,0.01,TRUE,-0.26880854047877145
+Dihydroxyacetone,Streptococcus_peroris,0.032,TRUE,-0.2143300522810503
+Galactaric.acid,Bacteroides_uniformis,0.007,TRUE,-0.2496476182512675
+Galactaric.acid,Streptococcus_peroris,0.023,TRUE,-0.2006868246330688
+Galactaric.acid,Bacteroides_fragilis,0.047,TRUE,0.16038174380065506
+Glucose..peak.1.,Veillonella_parvula,0.026,TRUE,0.2117754716376722
+Methionine,Bacteroides_fragilis,0.029,TRUE,0.1718703169729763
+Methionine,Veillonella_parvula,0.045,TRUE,0.1860541565753806
+Stearic.acid,Streptococcus_peroris,0.023,TRUE,-0.22489377384322376
+Stearic.acid,Akkermansia_muciniphila,0.038,TRUE,0.21431845700732527

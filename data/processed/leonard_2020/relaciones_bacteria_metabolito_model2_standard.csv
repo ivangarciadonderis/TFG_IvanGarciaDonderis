@@ -1,0 +1,9 @@
+metabolito,bacteria,p_perm,en_VIP,coeficiente
+Acetic.acid,Streptococcus_salivarius,0.014,TRUE,0.201503739868487
+Acetic.acid,Eggerthella_lenta,0.049,TRUE,-0.18027480177701133
+Galactaric.acid,Streptococcus_salivarius,0.022,TRUE,-0.16450000367999568
+Glycine,Streptococcus_salivarius,0.04,TRUE,0.1677856093324547
+Methionine,Streptococcus_salivarius,0.001,TRUE,-0.2514046444711462
+Methionine,Veillonella_dispar,0.022,TRUE,0.1836101718810888
+X4.Hydroxycyclohexylcarboxylic.acid,Eggerthella_lenta,0.045,TRUE,0.1926564039726767
+X4.Hydroxycyclohexylcarboxylic.acid,Parabacteroides_distasonis,0.046,TRUE,0.17916003630848515

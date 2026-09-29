@@ -1,0 +1,174 @@
+---
+title: "Preprocesamiento — Leonard et al. (2021)"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+date: "2026-06-28"
+---
+
+Este script aplica las transformaciones necesarias a cada matriz ómica antes del análisis exploratorio y los modelos estadísticos. 
+
+# Carga de librerías y datos
+
+```{r}
+library(tidyverse)
+library(compositions)
+library(here)
+
+processed_dir <- here("data", "processed", "leonard_2021")
+
+metadata_subjects       <- readRDS(file.path(processed_dir, "metadata_subjects.rds"))
+species_data_window     <- readRDS(file.path(processed_dir, "species_data_window.rds"))
+pathways_data_window    <- readRDS(file.path(processed_dir, "pathways_data_window.rds"))
+metabolites_data_window <- readRDS(file.path(processed_dir, "metabolites_data_window.rds"))
+
+dim(species_data_window)
+dim(pathways_data_window)
+dim(metabolites_data_window)
+```
+
+# Separación de metadatos y matrices numéricas
+
+Cada objeto cargado contiene columnas de metadatos (grupo, tiempo, covariables) mezcladas con las variables ómicas. Se separan en dos objetos distintos: uno con los metadatos (`_meta`) y otro con la matriz numérica pura (`_X`), que es la que recibirá las transformaciones.
+
+```{r}
+metadata_cols <- c(
+  "sample_id", "PaperID", "group", "pair_id",
+  "time_label", "TimePoint", "relative_time_label",
+  "sample_month", "onset_month", "relative_month",
+  "Country", "Gender", "Delivery_Mode", "Genetic_Risk"
+)
+
+species_meta <- species_data_window %>% select(any_of(metadata_cols))
+species_X    <- species_data_window %>%
+  select(-any_of(metadata_cols)) %>%
+  mutate(across(everything(), as.numeric))
+
+pathways_meta <- pathways_data_window %>% select(any_of(metadata_cols))
+pathways_X    <- pathways_data_window %>%
+  select(-any_of(metadata_cols)) %>%
+  mutate(across(everything(), as.numeric))
+
+metabolites_meta <- metabolites_data_window %>% select(any_of(metadata_cols))
+metabolites_X    <- metabolites_data_window %>%
+  select(-any_of(metadata_cols)) %>%
+  mutate(across(everything(), as.numeric))
+
+dim(species_X)
+dim(pathways_X)
+dim(metabolites_X)
+```
+
+
+# Comprobación de valores faltantes
+
+Antes de aplicar cualquier transformación se verifica si existen valores faltantes en alguna de las matrices. La presencia de NAs afectaría directamente a transformaciones como el CLR o el logaritmo.
+
+```{r}
+missing_summary <- function(X, dataset_name) {
+  tibble(
+    dataset              = dataset_name,
+    n_samples            = nrow(X),
+    n_variables          = ncol(X),
+    total_missing        = sum(is.na(X)),
+    variables_with_missing = sum(colSums(is.na(X)) > 0)
+  )
+}
+
+bind_rows(
+  missing_summary(species_X,     "Species"),
+  missing_summary(pathways_X,    "Pathways"),
+  missing_summary(metabolites_X, "Metabolites")
+)
+```
+
+# Filtrado de variables de baja prevalencia — Microbioma
+
+Se eliminan aquellas variables presentes en menos del 10% de las muestras, es decir, se conservan únicamente las que tienen al menos un valor positivo en al menos el 10% de las muestras.
+
+```{r}
+filter_low_abundance <- function(X, min_prevalence = 0.10) {
+  prevalence <- colMeans(X > 0, na.rm = TRUE)
+  keep       <- prevalence >= min_prevalence
+  X[, keep, drop = FALSE]
+}
+
+species_X_filtered  <- filter_low_abundance(species_X,  min_prevalence = 0.10)
+pathways_X_filtered <- filter_low_abundance(pathways_X, min_prevalence = 0.10)
+
+cat("Species:  ", ncol(species_X),  "→", ncol(species_X_filtered),  "variables tras filtrado\n")
+cat("Pathways: ", ncol(pathways_X), "→", ncol(pathways_X_filtered), "variables tras filtrado\n")
+```
+
+# Transformación CLR — Microbioma
+
+Los datos de microbioma son composicionales: las abundancias de cada muestra son relativas entre sí y no tienen escala absoluta interpretable. La transformación CLR convierte estos datos a un espacio euclidiano adecuado para análisis multivariantes. Se añade un pseudoconteo de +1 antes de la transformación para evitar el logaritmo de cero, operando directamente sobre las abundancias absolutas tal como vienen en los datos originales.
+
+```{r}
+species_X_clr <- as.data.frame(
+  compositions::clr(compositions::acomp(as.matrix(species_X_filtered) + 1)),
+  check.names = FALSE
+)
+```
+
+```{r}
+pathways_X_clr <- as.data.frame(
+  compositions::clr(compositions::acomp(as.matrix(pathways_X_filtered) + 1)),
+  check.names = FALSE
+)
+```
+
+# Transformación logarítmica — Metabolómica
+
+Durante la inspección de la matriz metabolómica suplementaria (Dataset S4 del paper) se identificaron valores de magnitud anormalmente elevada (del orden de 10^7 - 10^9) en cinco metabolitos: Glucose, Allose, Glycerol, Cyclohexanecarboxylic acid y Glycine, afectando a un subconjunto de muestras en cada uno (entre 1 y 26, según la variable). La comparación con los boxplots de la Fig. S2 del propio artículo mostró que estos valores eran compatibles con una pérdida del separador decimal en determinadas celdas del Excel original: por ejemplo, un valor almacenado como 1847418604 para Glycerol coincide, tras dividir por 10^9, con el máximo (~1.85) representado en dicha figura. Esta corrección constituye una decisión de control de calidad inferida a partir de la coherencia entre los datos suplementarios y las figuras publicadas, ya que los autores no describen explícitamente esta incidencia. No se aplica ningún tratamiento equivalente a otras variables porque no se detectó el mismo patrón en el resto de la matriz.
+
+```{r}
+metabolites_X <- metabolites_X %>%
+  mutate(
+    Glucose = if_else(Glucose > 10, Glucose / 1e9, Glucose),
+    Allose  = if_else(Allose  > 10, Allose  / 1e9, Allose),
+    Glycerol = if_else(Glycerol > 10, Glycerol / 1e9, Glycerol),
+    `Cyclohexanecarboxylic acid` = if_else(`Cyclohexanecarboxylic acid` > 10,
+                                            `Cyclohexanecarboxylic acid` / 1e9,
+                                            `Cyclohexanecarboxylic acid`),
+    Glycine = if_else(Glycine > 10, Glycine / 1e8, Glycine)
+  )
+```
+
+
+```{r}
+metabolites_X_log <- log(metabolites_X + 1)
+```
+
+Comprobación rápida de que la corrección surtió efecto (los máximos ya no deberían ser del orden de millones):
+
+```{r}
+metabolites_X %>%
+  select(Glucose, Allose, Glycerol, `Cyclohexanecarboxylic acid`, Glycine) %>%
+  summary()
+```
+
+# Reconstrucción de los objetos finales
+
+Se vuelven a unir los metadatos con las matrices transformadas, generando los objetos definitivos que se usarán en los análisis posteriores.
+
+```{r}
+species_clr_data     <- bind_cols(species_meta,     species_X_clr)
+pathways_clr_data    <- bind_cols(pathways_meta,    pathways_X_clr)
+metabolites_log_data <- bind_cols(metabolites_meta, metabolites_X_log)
+
+dim(species_clr_data)
+dim(pathways_clr_data)
+dim(metabolites_log_data)
+```
+
+# Guardado de datos preprocesados
+
+```{r}
+saveRDS(species_clr_data,     file.path(processed_dir, "species_clr_data.rds"))
+saveRDS(pathways_clr_data,    file.path(processed_dir, "pathways_clr_data.rds"))
+saveRDS(metabolites_log_data, file.path(processed_dir, "metabolites_log_data.rds"))
+```
+

@@ -1,0 +1,551 @@
+---
+title: "Enriquecimiento funcional y comparación con Paper 14 (Loberman-Nachum et al. 2019)"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(tidyverse)
+library(knitr)
+library(readxl)
+library(here)
+
+raw_dir       <- here("data", "raw", "loberman_nachum")
+processed_dir <- here("data", "processed", "loberman_nachum")
+
+# El Excel suplementario del paper es un dato externo (raw), no un resultado propio
+paper_supp_path <- file.path(raw_dir, "41598_2019_52733_MOESM2_ESM.xlsx")
+```
+
+# Introducción
+
+Este documento compara el enriquecimiento funcional de las listas de genes seleccionadas en `PLS-DA.Rmd` con los hallazgos del paper original, en tres niveles:
+
+1. **Procesos biológicos coincidentes** — qué categorías del paper recuperamos también nosotros, y con qué genes concretos.
+2. **Genes exclusivos nuestros** — genes de nuestra selección que no están en los 878 genes diferencialmente expresados del paper, valorando su plausibilidad biológica.
+3. **Procesos biológicos exclusivos nuestros** — términos que salen significativos en nuestro análisis y que el paper no recupera, ni en el texto ni en su propio material suplementario.
+
+El enriquecimiento se hizo directamente en **ToppGene** (la misma herramienta que usa el paper), con la misma configuración (FDR Benjamini-Hochberg, 15 categorías de anotación), sobre las listas del combo **VIP + Jack-knife** (criterio definitivo elegido, comparado más adelante con VIP + Permutación).
+
+**Número de genes de entrada** (combo VIP+Jack-knife):
+
+| Perfil | Nº genes |
+|---|---|
+| Celiac (up) | 69 |
+| Control (down) | 131 |
+| **Total** | **200** |
+
+# 1. Carga de datos
+
+## 1.1. Resultados de ToppGene (combo VIP+Jack-knife)
+
+Se excluye Pubmed: es co-citación bibliográfica (miles de artículos que mencionan un gen concreto), no representa una función biológica y añade solo ruido a la comparación.
+
+```{r}
+# Normaliza el nombre del término antes de buscar palabras clave: pasa a minúsculas y
+# convierte guiones bajos en espacios. Sin esto, nombres de rutas tipo
+# "NUCLEAR_RECEPTORS_METAPATHWAY" no se detectaban como coincidentes con "nuclear receptor",
+# porque el guion bajo no es un espacio para str_detect. Se define aquí, al principio,
+# para que esté disponible en todas las secciones que la usan (2.0, 2.1, 4, 6).
+norm_name <- function(x) str_replace_all(str_to_lower(x), "_", " ")
+
+read_toppgene <- function(path, profile_label) {
+  read_tsv(path, col_types = cols(.default = "c")) %>%
+    mutate(
+      profile              = profile_label,
+      `p-value`            = as.numeric(`p-value`),
+      `q-value Bonferroni` = as.numeric(`q-value Bonferroni`),
+      `q-value FDR B&H`    = as.numeric(`q-value FDR B&H`),
+      `q-value FDR B&Y`    = as.numeric(`q-value FDR B&Y`),
+      `Hit Count in Query List` = as.numeric(`Hit Count in Query List`),
+      `Hit Count in Genome`     = as.numeric(`Hit Count in Genome`)
+    )
+}
+
+toppgene_celiac  <- read_toppgene(file.path(processed_dir, "toppgene_celiac_jk.txt"),  "Celiac")
+toppgene_control <- read_toppgene(file.path(processed_dir, "toppgene_control_jk.txt"), "Control")
+
+toppgene_raw <- bind_rows(toppgene_celiac, toppgene_control)
+
+toppgene_all <- toppgene_raw %>% filter(Category != "Pubmed")
+
+cat("Términos significativos cargados (sin Pubmed):", nrow(toppgene_all), "\n")
+```
+
+## 1.2. Lista de 878 genes diferencialmente expresados del paper
+
+```{r}
+paper_878 <- read_excel(paper_supp_path, sheet = "core 878 genes", skip = 2,
+                        col_names = c("Gene", "p_corr", "FC", "direction",
+                                      "in_Bragde", "in_Crohn", "in_403shared")) %>%
+  filter(!is.na(Gene))
+
+cat("Genes cargados del paper:", nrow(paper_878),
+    "(", sum(paper_878$direction == "down"), "down /",
+    sum(paper_878$direction == "up"), "up )\n")
+```
+
+## 1.3. Enriquecimiento funcional propio del paper (Supplementary Dataset 1)
+
+Las hojas `354of878_Down-reg func enrich` y `524of878_Up-reg func enrich` del Excel suplementario no tienen formato de tabla tidy — mezclan cabeceras de categoría con filas de términos. Se parsean con una función auxiliar que distingue ambos tipos de fila por si la primera columna es o no convertible a número:
+
+```{r}
+extract_paper_enrichment <- function(path, sheet) {
+  raw <- read_excel(path, sheet = sheet, col_names = FALSE)
+
+  current_cat <- NA_character_
+  out <- vector("list", nrow(raw))
+
+  for (i in seq_len(nrow(raw))) {
+    col1 <- raw[[1]][i]
+    col2 <- raw[[2]][i]
+    col3 <- raw[[3]][i]
+
+    es_numero <- !is.na(suppressWarnings(as.numeric(col1)))
+
+    if (!is.na(col1) && !es_numero && is.na(col2)) {
+      current_cat <- col1
+    } else if (es_numero && !is.na(col3)) {
+      out[[i]] <- tibble(category = current_cat, term = as.character(col3))
+    }
+  }
+
+  bind_rows(out) %>% distinct()
+}
+
+paper_enrichment_down <- extract_paper_enrichment(paper_supp_path, "354of878_Down-reg func enrich")
+paper_enrichment_up   <- extract_paper_enrichment(paper_supp_path, "524of878_Up-reg func enrich")
+
+cat("Términos en el enriquecimiento propio del paper:\n")
+cat("  Down-regulado:", nrow(paper_enrichment_down), "(debería rondar 294)\n")
+cat("  Up-regulado:  ", nrow(paper_enrichment_up), "(debería rondar 334)\n")
+```
+
+# 2. Procesos biológicos coincidentes con el paper
+
+## 2.0. Checklist de las categorías que el paper menciona explícitamente
+
+**Por qué no basta con contar "términos coincidentes" sin más**: el paper parte de 878 genes de entrada (nosotros de 200), así que es inevitable que a ellos les salgan muchos más términos enriquecidos solo por tener una lista más grande — eso no refleja mejor biología, solo mayor tamaño muestral de genes. Comparar recuentos absolutos de términos no es una métrica justa entre ambos análisis.
+
+Un denominador correcto y acotado: el paper menciona **explícitamente en el texto principal** un conjunto finito de categorías biológicas (no cientos de términos GO, solo las que ellos mismos destacan como hallazgo). Se comprueba, una por una, si nuestro análisis las recupera con FDR<0.05:
+
+```{r}
+categorias_paper <- tibble::tribble(
+  ~perfil,   ~categoria_paper,                  ~p_paper,       ~patron,
+  "Control", "Lipid metabolic processes",       "P<1.97E-11",  "lipid metabolic process",
+  "Control", "Apolipoproteins",                 "P<5.07E-3",   "apolipoprotein",
+  "Control", "Vitamin metabolism/absorption",   "P<4.29E-7",   "vitamin|intestinal absorption",
+  "Control", "Oxidoreductase/NAD(P) activity",  "P<2.10E-6",   "oxidoreductase",
+  "Control", "Brush border membrane",           "(Fig. 1b)",   "brush border",
+  "Celiac",  "Interferon alpha/beta signaling", "P<6.71E-7",   "interferon.*signaling",
+  "Celiac",  "Alpha-beta T cells",              "P<6.55E-55",  "alpha.beta t cell",
+  "Celiac",  "Gamma-delta T cells",             "P<3.34E-50",  "gamma.delta t cell",
+  "Celiac",  "Mitotic cell cycle division",     "P<2.4E-19",   "mitotic cell cycle",
+  "Celiac",  "Nuclear division",                "P<7.05E-18",  "nuclear division",
+  "Celiac",  "CDK1 interactions",                "P<6.18E-18", "cdk1|mitotic spindle"
+)
+
+# Función reutilizable: construye el checklist para cualquier tabla de ToppGene
+# (se reutiliza en la sección 6 para el combo VIP+Permutación)
+construir_checklist <- function(datos_toppgene, categorias_tbl) {
+  categorias_tbl %>%
+    rowwise() %>%
+    mutate(
+      match_df = list(
+        datos_toppgene %>%
+          filter(profile == perfil) %>%
+          filter(str_detect(norm_name(Name), patron)) %>%
+          arrange(`p-value`) %>%
+          slice(1)
+      )
+    ) %>%
+    mutate(
+      recuperado     = nrow(match_df) > 0,
+      termino_propio = if (recuperado) match_df$Name[1] else NA_character_,
+      fdr_propio     = if (recuperado) match_df$`q-value FDR B&H`[1] else NA_real_
+    ) %>%
+    ungroup() %>%
+    dplyr::select(perfil, categoria_paper, p_paper, recuperado, termino_propio, fdr_propio)
+}
+
+mapeo_categorias <- construir_checklist(toppgene_all, categorias_paper)
+
+cat("Categorías del paper recuperadas (JK):", sum(mapeo_categorias$recuperado),
+    "de", nrow(mapeo_categorias), "\n")
+
+mapeo_categorias %>%
+  kable(caption = "Checklist: categorías explícitas del paper vs. nuestro propio término equivalente (JK)",
+        digits = 6)
+```
+
+**Esta es la cifra que citamos en la memoria**: recuperamos 11 de 11 categorías explícitas del paper, cada una con un término propio equivalente y su FDR — un ratio con denominador acotado y justo, no una cifra absoluta sin referencia.
+
+## 2.1. Detalle ampliado por palabra clave (información de apoyo, no comparable 1:1 con el paper)
+
+Las tablas siguientes amplían el detalle de qué términos concretos sustentan cada categoría, usando una búsqueda más laxa por palabra clave. **Aviso**: estos recuentos (194/185 términos) no son comparables directamente con el número de términos del paper, precisamente por la diferencia de tamaño entre las dos listas de entrada (200 vs 878 genes) explicada arriba — sirven solo para inspeccionar el detalle, no como métrica de comparación.
+
+```{r}
+kw_control <- c("lipid", "apolipoprotein", "oxidoreductase", "vitamin", "mineral",
+                "brush border", "cholesterol", "fat digestion", "absorption", "retinol",
+                "fatty acid", "sterol", "steroid", "carboxylic acid", "oxoacid", "organic acid",
+                "terpenoid", "isoprenoid", "chylomicron", "lipoprotein", "triglyceride",
+                "acylglycerol", "apical", "xenobiotic", "digesti", "nutrient", "nuclear receptor",
+                "symporter", "hydroxy compound transport", "alcohol", "statin", "nrf2",
+                "androstane", "pregnane", "liver x receptor", "ppar", "toxic",
+                "drug-induced liver", "acyltransferase", "redox", "microvill", "hormone",
+                "meprin", "actin-based cell projection", "plasma membrane region")
+
+kw_celiac <- c("interferon", "cell cycle", "nuclear division", "mitotic",
+               "t cell", "alpha-beta", "gamma-delta", "cdk1", "lymphocyte",
+               "spindle", "chromosome", "midbody", "plk1", "cytokine", "immune",
+               "leukocyte", "mononuclear cell", "b cell", "defense response",
+               "virus", "viral", "biotic stimulus", "mitosis", "aurora", "chemokine",
+               "interleukin", "proliferation", "bacterium", "cell division",
+               "chromatid", "foxm1", "ranms", "sarscov2", "antigen presentation",
+               "mhc class i", "organelle fission")
+
+comparacion_control <- toppgene_all %>%
+  filter(profile == "Control") %>%
+  filter(str_detect(norm_name(Name), str_c(kw_control, collapse = "|"))) %>%
+  arrange(`p-value`) %>%
+  dplyr::select(Category, Name, `p-value`, `q-value FDR B&H`, `Hit Count in Query List`, `Hit in Query List`)
+
+comparacion_celiac <- toppgene_all %>%
+  filter(profile == "Celiac") %>%
+  filter(str_detect(norm_name(Name), str_c(kw_celiac, collapse = "|"))) %>%
+  filter(Category %in% c("GO: Molecular Function", "GO: Biological Process",
+                         "GO: Cellular Component", "Pathway",
+                         "Mouse Phenotype", "Human Phenotype")) %>%
+  arrange(`p-value`) %>%
+  dplyr::select(Category, Name, `p-value`, `q-value FDR B&H`, `Hit Count in Query List`, `Hit in Query List`)
+
+cat("Términos coincidentes (detalle ampliado) -> Control:", nrow(comparacion_control),
+    " | Celiac:", nrow(comparacion_celiac), "\n")
+```
+
+### Perfil Celiac (up-regulado)
+
+```{r}
+comparacion_celiac %>%
+  slice_head(n = 30) %>%
+  dplyr::select(-`Hit in Query List`) %>%
+  kable(caption = "Detalle ampliado: términos relacionados con las categorías del paper (perfil Celiac)")
+```
+
+Los términos se agrupan en dos bloques biológicos muy claros, casi alternándose por p-valor — señal de que ambos ejes tienen prácticamente la misma fuerza estadística en nuestra lista, igual que en el paper.
+
+**Bloque 1 — ciclo celular / división mitótica**: `mitotic cell cycle process` (FDR=9.0E-7, 18 genes: AURKA, CCNB1, CCNA2, PLK1, PRC1, CEP55, NDC80, TPX2, MKI67, RRM2, EZH2, ECT2, BRCA1...). **CCNB1** y **MKI67** son, precisamente, los dos genes que el paper valida por inmunohistoquímica (tinción de ciclina B1 y Ki-67 en criptas epiteliales, Fig. 2c-f) — que aparezcan agrupados aquí bajo el término con el p-valor más bajo de toda la tabla es una confirmación directa de que recuperamos el eje central del segundo hallazgo del paper.
+
+**Bloque 2 — interferón / inmunidad**: `interferon-mediated signaling pathway` (FDR=5.0E-6, 8 genes: IFNG, ZBP1, OAS2, OAS3, MMP12, PARP14, IFI27, STAT1). **STAT1** está además en nuestro núcleo de 9 genes triple-confirmados (VIP+JK+sMC), y **IFNG** es la citocina que el paper menciona explícitamente en la discusión como reguladora de la proliferación epitelial — coincidencia directa con su propio razonamiento biológico, no solo con sus resultados.
+
+Un matiz propio: `cytokine production` y `positive regulation of tumor necrosis factor production` (MIF, FCGR3A, LGALS9) apuntan a una señal de citocinas proinflamatorias tipo TNF que el paper no destaca tanto en el texto — se retoma como hallazgo propio en la sección 4.
+
+### Perfil Control (down-regulado)
+
+```{r}
+comparacion_control %>%
+  slice_head(n = 30) %>%
+  dplyr::select(-`Hit in Query List`) %>%
+  kable(caption = "Detalle ampliado: términos relacionados con las categorías del paper (perfil Control)")
+```
+
+Aquí el eje "metabolismo epitelial suprimido" es todavía más dominante que en Celiac. `lipid metabolic process` (FDR≈0, 39 genes) es el término con más genes de toda la tabla, con **APOA1, APOA4, APOB, APOC3, CYP3A4, ACOX1, HMGCS2, LRP1, HSD17B11** repitiéndose en casi todos los términos relacionados — coincide casi textualmente con *"decrease of epithelial lipid metabolic processes genes"* del paper.
+
+**APOA1** es uno de nuestros 9 genes triple-confirmados, y es exactamente el gen que **el paper valida por qPCR** (Fig. 1d, P<0.0001). Además, en el término `digestion` aparece **SI** (sucrase-isomaltase) — el segundo gen que el paper valida por qPCR e inmunohistoquímica (brush border, Fig. 1e-f). Tener ambos genes de validación experimental del paper dentro de nuestros propios términos más significativos es la pieza más sólida de convergencia entre ambos análisis.
+
+`regulation of intestinal absorption` (APOA1, APOA4, ABCB1, PRAP1, ABCG2, ABCG5) e `intestinal absorption` coinciden con la categoría de vitaminas/absorción del paper, y `retinoid metabolic process` (RBP2, RETSAT, CYP4V2, LRP1) encaja con "Retinol metabolism", una de las categorías explícitas de su Fig. 1b.
+
+# 3. Genes exclusivos nuestros (no están en los 878 del paper)
+
+Se reconstruye la lista completa de genes de entrada a partir de la columna `Hit in Query List` de ToppGene, y se compara contra los 878 genes DE del paper.
+
+```{r}
+extraer_genes_entrada <- function(df) {
+  df$`Hit in Query List` %>%
+    na.omit() %>%
+    str_split(",") %>%
+    unlist() %>%
+    str_trim() %>%
+    unique()
+}
+
+genes_celiac_entrada  <- extraer_genes_entrada(toppgene_all %>% filter(profile == "Celiac"))
+genes_control_entrada <- extraer_genes_entrada(toppgene_all %>% filter(profile == "Control"))
+
+genes_celiac_exclusivos  <- setdiff(genes_celiac_entrada,  paper_878$Gene)
+genes_control_exclusivos <- setdiff(genes_control_entrada, paper_878$Gene)
+
+cat("Genes exclusivos nuestros (no en los 878 del paper):\n")
+cat("  Celiac: ", length(genes_celiac_exclusivos),  "de", length(genes_celiac_entrada),  "\n")
+cat("  Control:", length(genes_control_exclusivos), "de", length(genes_control_entrada), "\n")
+```
+
+**37% de nuestra selección total (74 de 200 genes) no está en los 878 del paper** — una fracción sustancial, que el filtro univariante clásico del paper (FC≥1.5 + FDR<0.05) no habría detectado.
+
+```{r}
+cat("Genes exclusivos (Celiac):\n")
+print(genes_celiac_exclusivos)
+
+cat("\nGenes exclusivos (Control):\n")
+print(genes_control_exclusivos)
+```
+
+Queda pendiente estudiar su posible relación con la enfermedad celíaca (revisión bibliográfica individual en GeneCards/PubMed) para valorar si alguno constituye un hallazgo metodológico aprovechable — tarea de la fase de interpretación, fuera del alcance de este documento de código.
+
+# 4. Procesos biológicos exclusivos nuestros (no recuperados por el paper, ni en texto ni en su propio suplementario)
+
+**Enfoque correcto (invertido respecto a un primer intento)**: en vez de coger el top-N de términos más significativos y luego quitar los que coinciden *literalmente* con el texto del paper (lo cual deja pasar variantes de redacción del mismo concepto, como "sterol metabolic process" en vez de "lipid metabolic process" — no son literalmente el mismo string, pero sí el mismo hallazgo ya conocido), se hace al revés:
+
+1. **Primero se excluye** cualquier término que temáticamente pertenezca a alguna de las 11 categorías ya conocidas — usando las mismas palabras clave amplias (`kw_control`/`kw_celiac` de la sección 2.1), no una coincidencia exacta de texto. Esto elimina de raíz todas las variantes/sinónimos de lípidos, colesterol, interferón, mitosis, células T, etc., sea cual sea su redacción concreta.
+2. **Se excluye también el ruido propio de la categoría Disease de ToppGene**: además de enfermedades en sentido clínico, esta categoría incluye entradas de tipo "medición de biomarcador" procedentes de estudios GWAS (p. ej. "choline measurement", "level of complement C1q-like protein 2 in blood serum") — no son hallazgos de enfermedad, sino que el gen en cuestión fue medido como rasgo cuantitativo en algún estudio poblacional. Se descartan por patrón genérico, no una por una.
+3. **De lo que queda**, se ordena por significación y se inspeccionan los candidatos — ahí es donde puede haber biología genuinamente nueva.
+
+```{r}
+cats_relevantes <- c("GO: Molecular Function", "GO: Biological Process", "GO: Cellular Component",
+                     "Pathway", "Disease", "Mouse Phenotype", "Human Phenotype", "Gene Family")
+
+top_n_terminos <- 50
+
+# Patrón genérico de "ruido" de la categoría Disease: mediciones de biomarcador GWAS,
+# no enfermedades en sentido clínico
+ruido_disease <- "measurement|level of .+ in blood|\\(biomarker"
+
+procesos_nuevos <- function(datos_toppgene, profile_label, kw_conocidos, n = top_n_terminos) {
+  datos_toppgene %>%
+    filter(profile == profile_label, Category %in% cats_relevantes) %>%
+    filter(!str_detect(norm_name(Name), str_c(kw_conocidos, collapse = "|"))) %>%
+    filter(!(Category == "Disease" & str_detect(str_to_lower(Name), ruido_disease))) %>%
+    arrange(`p-value`) %>%
+    slice_head(n = n) %>%
+    dplyr::select(Category, Name, `p-value`, `q-value FDR B&H`, `Hit Count in Query List`, `Hit in Query List`)
+}
+
+procesos_exclusivos_celiac  <- procesos_nuevos(toppgene_all, "Celiac",  kw_celiac)
+procesos_exclusivos_control <- procesos_nuevos(toppgene_all, "Control", kw_control)
+
+cat("Candidatos tras excluir temática conocida y ruido de Disease (JK) -> Celiac:", nrow(procesos_exclusivos_celiac),
+    " | Control:", nrow(procesos_exclusivos_control), "\n")
+```
+
+**Nota sobre esta versión**: la primera pasada con `kw_control`/`kw_celiac` originales (sección 2.1) dejaba pasar demasiado ruido — muchos "candidatos" resultaron ser la misma biología ya conocida, solo con vocabulario distinto que las palabras clave no cubrían (p. ej. "sterol", "fatty acid", "chylomicron" para lípidos; "spindle", "chromosome", "cytokine", "leukocyte" para mitosis/inmunidad). Las listas de la sección 2.1 ya incorporan esas ampliaciones, así que la exclusión aquí es más estricta que en una primera versión de este documento.
+
+## 4.1. Perfil Celiac — candidatos y hallazgos genuinos
+
+```{r}
+procesos_exclusivos_celiac %>%
+  dplyr::select(-`Hit in Query List`) %>%
+  kable(caption = "Candidatos (Celiac) tras excluir toda temática ya conocida y ruido de Disease")
+```
+
+De esta tabla hay que separar varios tipos de resultado:
+
+**1. Artefacto a descartar — términos de Disease/Mouse Phenotype de cáncer e infección, no relacionados con celiaquía**: `Liver carcinoma`, `Influenza`, `lung non-small cell carcinoma`, `urinary bladder cancer`, `Liver Cirrhosis, Experimental`, `ovary epithelial cancer`, `Malignant neoplasm of breast`, y toda la familia de fenotipos de ratón de "tumor incidence" (`increased/abnormal tumor incidence`, `neoplasm`, `increased lymphoma incidence`...). Esto **no es biología nueva de celiaquía** — es un efecto colateral esperable de tener genes de proliferación/ciclo celular (marcadores compartidos con cáncer) y de interferón (respuesta antiviral compartida con infecciones como la gripe, herpesvirus, etc.) en la lista. Cualquier conjunto de genes con esa composición mostraría asociación estadística con estas enfermedades no relacionadas. Tampoco se reportan como hallazgo `allergic disease`, `graft-versus-host disease` ni `BCGitis` (fenotipo ligado a IFNG) — son la misma huella del eje interferón/inmunidad ya cubierto, vista a través de bases de datos de enfermedad en vez de GO.
+
+**2. Hallazgos verificados como genuinamente distintos** (no reformulaciones de mitosis/interferón, y con sentido biológico propio):
+
+- **`Celiac Disease`** como término de Disease (DisGeNET, ~5 genes, aquí con el p-valor más bajo de todos: 1E-7) — nuestra lista está directamente enriquecida para el nombre de la propia enfermedad como entidad catalogada, algo que el enriquecimiento propio del paper no capturó. Es la validación más directa posible: no solo vías relacionadas, sino asociación nominal a la enfermedad. **Este mismo término reaparece también en el perfil Control** (ver 4.2) — dos conjuntos de genes con dirección opuesta, ambos asociados de forma independiente al nombre de la enfermedad, es una pieza de validación cruzada notable.
+- **Estrés de retículo endoplásmico / células plasmáticas** (`endoplasmic reticulum protein-containing complex`, coherente con MZB1 y PDIA4) — un matiz de actividad secretora de células B/plasmáticas que el paper no resalta.
+
+**3. Candidato adicional a valorar — regulación de apoptosis**: `regulation of apoptotic process`, `regulation of programmed cell death`. A diferencia de la proliferación (ya cubierta por el eje mitótico), la apoptosis es el proceso opuesto — muerte celular programada. Que aparezca como eje propio, distinto de la proliferación, podría reflejar el equilibrio proliferación/muerte celular en el recambio epitelial acelerado de la celiaquía, algo que el paper no discute explícitamente. Candidato razonable, pendiente de contrastar con literatura.
+
+**4. Caso límite, pendiente de decidir el encuadre — eje de TNF/citocinas proinflamatorias**: `positive regulation of tumor necrosis factor production`, `tumor necrosis factor production`, `regulation of tumor necrosis factor production` (genes MIF, FCGR3A, LGALS9). El paper menciona TNF de pasada en la discusión (citando literatura externa sobre citocinas que regulan la proliferación epitelial), pero no lo reporta como resultado propio de su enriquecimiento — sigue siendo defendible como matiz propio, pero podría considerarse parte del mismo paraguas de "activación inmune" ya cubierto por interferón. Queda pendiente de decidir el encuadre exacto en la memoria.
+
+**5. Términos descartados por ser demasiado genéricos/inespecíficos para interpretar** (no aportan por sí solos, sin verse acompañados de algo más concreto): `response to peptide`, `response to other organism`, `regulation of response to stress`, `protein homodimerization activity`, `regulation of protein modification process`, `establishment of protein localization`, `abnormal cerebral cortex cell density` (probable pleiotropía de algún gen mitótico compartido con neurogénesis, no hallazgo).
+
+**Nota de depuración**: con esta ejecución aparecieron unos pocos residuos más del mismo eje mitótico/viral con vocabulario que las palabras clave todavía no cubrían (`cell division`, `organelle fission`, `sister chromatid segregation`, `PID_FOXM1_PATHWAY`, `BIOCARTA_RANMS_PATHWAY`, `WP_NETWORK_MAP_OF_SARSCOV2_SIGNALING`, `abnormal antigen presentation via MHC class I`) — se han añadido a `kw_celiac` (`cell division`, `chromatid`, `foxm1`, `ranms`, `sarscov2`, `antigen presentation`, `mhc class i`, `organelle fission`) para la siguiente ejecución. Ninguno de estos cambia las conclusiones ya alcanzadas — son la misma biología ya identificada (mitosis, interferón), solo con nombres de ruta/fenotipo distintos.
+
+## 4.2. Perfil Control — candidatos
+
+```{r}
+procesos_exclusivos_control %>%
+  dplyr::select(-`Hit in Query List`) %>%
+  kable(caption = "Candidatos (Control) tras excluir toda temática ya conocida y ruido de Disease")
+```
+
+**El hallazgo más destacable de esta tabla**: **`Celiac Disease`** (Disease, DisGeNET, 4 genes, FDR=0.0077) también aparece aquí, en el perfil down-regulado — el mismo término que en Celiac, ahora desde el lado de los genes que bajan. Tener el nombre de la enfermedad enriquecido de forma independiente en **ambas direcciones** del modelo es la pieza de validación más sólida de todo este análisis exclusivo: no depende de un único perfil ni de un umbral concreto.
+
+**Dos clústeres nuevos, genuinamente distintos del eje lipídico, y con sentido biológico propio**:
+
+- **Homeostasis de hierro/hemo**: `heme binding`, `tetrapyrrole binding`, `REACTOME_HEME_SIGNALING`, `intracellular iron ion homeostasis`, `transition metal ion transport`, `REACTOME_IRON_UPTAKE_AND_TRANSPORT`. Este es el hallazgo más interesante de toda la sección de Control — **no es ruido de lípidos**, es un eje metabólico distinto, y además muy plausible clínicamente: la **anemia ferropénica por malabsorción es una de las presentaciones clásicas de la celiaquía** (el propio paper usa "anemia" como uno de los motivos de endoscopia de sus sujetos control en la Tabla 1, aunque no lo relaciona con su signature de genes). Candidato sólido para mencionar en la memoria.
+- **Transportadores epiteliales generales**: `urate transport`, `urate transmembrane transporter activity`, `salt transmembrane transporter activity`, `transepithelial transport`, `active transmembrane transporter activity`, `transporter activity`, `Solute carriers` (Gene Family). Podría reflejar una disfunción más amplia de la maquinaria de transporte epitelial, no limitada a los transportadores lipídicos/vitamínicos ya cubiertos por el paper. Candidato a mencionar, pendiente de contraste bibliográfico.
+
+**Un tercer clúster, sin conexión evidente con celiaquía**: `response to axon injury`, `axon regeneration`, `neuron projection regeneration` — ya no es un término aislado (como se pensaba en una versión anterior de este documento), son tres términos coherentes entre sí, pero de temática neuronal sin relación aparente con el epitelio intestinal. Pendiente de revisión bibliográfica antes de decidir si se menciona o se descarta como coincidencia de genes compartidos con otro contexto biológico.
+
+El resto de la tabla se reparte en dos grupos de ruido, sin hallazgo:
+
+- **Ruido residual de temática ya conocida, con vocabulario aún más específico**: `REACTOME_METABOLISM`, `retinoid metabolic process`, `small molecule biosynthetic/transport`, `chemical homeostasis`, `Bone morphogenetic proteins|Astacins`, el bloque `Drug-Induced Liver/Acute Liver Injury`, `Chemical and Drug Induced Liver Injury`, `Hepatitis, Drug-Induced`, `REACTOME_PHASE_I_FUNCTIONALIZATION_OF_COMPOUNDS`, `REACTOME_DRUG_ADME`, `WP_IRINOTECAN_PATHWAY`, `WP_CODEINE_AND_MORPHINE_METABOLISM` (todo xenobiótico/CYP, ya cubierto), `BIOCARTA_NUCLEARRS_PATHWAY` (receptores nucleares, ya cubierto), `oxidative stress` (mismo eje que oxidorreductasa). No son hallazgos nuevos.
+- **Ruido de la categoría Disease tipo GWAS/enfermedad no relacionada**: `type 2 diabetes mellitus`, `Behcet Syndrome`, `ovarian cancer` — mismo tipo de artefacto de solapamiento de genes ya visto en Celiac (el propio paper, de hecho, menciona "Diabetes" en su propia figura de enriquecimiento down-regulado, así que ni siquiera sería exclusivo nuestro). Se descartan como ruido.
+
+# 5. Resumen de síntesis (JK)
+
+```{r}
+resumen_sintesis <- tibble(
+  bloque = c(
+    "Categorías explícitas del paper recuperadas (de 11)",
+    "Detalle ampliado por palabra clave (Control) — no comparable 1:1",
+    "Detalle ampliado por palabra clave (Celiac) — no comparable 1:1",
+    "Genes exclusivos nuestros (Control)",
+    "Genes exclusivos nuestros (Celiac)",
+    "Candidatos a proceso nuevo tras exclusión temática (Control)",
+    "Candidatos a proceso nuevo tras exclusión temática (Celiac)"
+  ),
+  n = c(
+    sum(mapeo_categorias$recuperado),
+    nrow(comparacion_control),
+    nrow(comparacion_celiac),
+    length(genes_control_exclusivos),
+    length(genes_celiac_exclusivos),
+    nrow(procesos_exclusivos_control),
+    nrow(procesos_exclusivos_celiac)
+  )
+)
+
+resumen_sintesis %>%
+  kable(caption = "Resumen de síntesis: coincidencias, genes exclusivos y procesos exclusivos")
+```
+
+**Nota sobre esta última fila**: el número de "candidatos" no equivale a "hallazgos genuinos" — de los candidatos de Celiac, 2 ya están verificados manualmente como genuinos (Celiac Disease, estrés de RE), 1 más se propone como candidato razonable (regulación de apoptosis), y 1 queda como caso límite a decidir (eje TNF); varios son artefacto de solapamiento con enfermedades no relacionadas (cáncer, gripe) y se descartan. En Control, además de la validación cruzada de `Celiac Disease`, aparecen dos clústeres nuevos con sentido biológico propio (homeostasis de hierro/hemo — clínicamente plausible, ligado a la anemia ferropénica típica de la celiaquía — y transportadores epiteliales generales), y un tercer clúster de temática neuronal sin relación aparente (`axon injury/regeneration`) pendiente de revisión.
+
+**En una frase**: con VIP+Jack-knife recuperamos, con FDR<0.05, las 11 categorías biológicas explícitas que el paper reporta en su texto (frente a solo 8 de 11 con VIP+Permutación) —incluyendo los genes que ellos mismos validan por proteína (CCNB1, MKI67, APOA1, SI)—, aportamos un tercio de genes adicionales no capturados por su filtro univariante (pendientes de revisión bibliográfica), y encontramos que el término **"Celiac Disease" aparece enriquecido de forma independiente en ambos perfiles** (up y down), la pieza de validación más sólida de todo el análisis exclusivo; además verificamos el estrés de retículo endoplásmico y proponemos la regulación de apoptosis en Celiac, identificamos un clúster de homeostasis de hierro/hemo clínicamente plausible en Control (anemia ferropénica), y dejamos el eje de TNF y el clúster neuronal como casos pendientes de decidir — el resto de candidatos, en ambos perfiles, quedan pendientes de revisión manual.
+
+## Guardado (JK)
+
+```{r}
+saveRDS(toppgene_all,                  file.path(processed_dir, "toppgene_all_jk.rds"))
+saveRDS(mapeo_categorias,              file.path(processed_dir, "mapeo_categorias_jk.rds"))
+saveRDS(comparacion_control,           file.path(processed_dir, "comparacion_control.rds"))
+saveRDS(comparacion_celiac,            file.path(processed_dir, "comparacion_celiac.rds"))
+saveRDS(genes_celiac_exclusivos,       file.path(processed_dir, "genes_celiac_exclusivos.rds"))
+saveRDS(genes_control_exclusivos,      file.path(processed_dir, "genes_control_exclusivos.rds"))
+saveRDS(procesos_exclusivos_celiac,    file.path(processed_dir, "procesos_exclusivos_celiac.rds"))
+saveRDS(procesos_exclusivos_control,   file.path(processed_dir, "procesos_exclusivos_control.rds"))
+saveRDS(resumen_sintesis,              file.path(processed_dir, "resumen_sintesis_enriquecimiento.rds"))
+```
+
+# 6. VIP + Permutación — repetición del análisis para justificar la no elección
+
+Se repiten los tres análisis anteriores con el combo VIP+Permutación (rep=1000), para comparar de forma directa y objetiva por qué se elige JK como criterio definitivo, no solo por número de genes sino por calidad del enriquecimiento recuperado.
+
+**Número de genes de entrada (VIP+Permutación)**: 34 (Celiac) + 89 (Control) = 123 total.
+
+```{r}
+toppgene_celiac_perm  <- read_toppgene(file.path(processed_dir, "toppgene_celiac_perm.txt"),  "Celiac")
+toppgene_control_perm <- read_toppgene(file.path(processed_dir, "toppgene_control_perm.txt"), "Control")
+
+toppgene_perm <- bind_rows(toppgene_celiac_perm, toppgene_control_perm) %>%
+  filter(Category != "Pubmed")
+
+comparacion_control_perm <- toppgene_perm %>%
+  filter(profile == "Control") %>%
+  filter(str_detect(norm_name(Name), str_c(kw_control, collapse = "|"))) %>%
+  arrange(`p-value`) %>%
+  dplyr::select(Category, Name, `p-value`, `q-value FDR B&H`, `Hit Count in Query List`)
+
+comparacion_celiac_perm <- toppgene_perm %>%
+  filter(profile == "Celiac") %>%
+  filter(str_detect(norm_name(Name), str_c(kw_celiac, collapse = "|"))) %>%
+  filter(Category %in% c("GO: Molecular Function", "GO: Biological Process",
+                         "GO: Cellular Component", "Pathway",
+                         "Mouse Phenotype", "Human Phenotype")) %>%
+  arrange(`p-value`) %>%
+  dplyr::select(Category, Name, `p-value`, `q-value FDR B&H`, `Hit Count in Query List`)
+
+cat("Coincidencias con el paper (detalle ampliado) -> Perm Control:", nrow(comparacion_control_perm),
+    " | Perm Celiac:", nrow(comparacion_celiac_perm), "\n")
+```
+
+## 6.0. Checklist de las 11 categorías del paper — también para Perm
+
+Igual que en la sección 2.0, pero aplicado a `toppgene_perm` — así comparamos ambos criterios con el mismo denominador acotado (11 categorías explícitas), no solo con el detalle amplio por palabra clave.
+
+```{r}
+mapeo_categorias_perm <- construir_checklist(toppgene_perm, categorias_paper)
+
+cat("Categorías del paper recuperadas (Perm):", sum(mapeo_categorias_perm$recuperado),
+    "de", nrow(mapeo_categorias_perm), "\n")
+
+mapeo_categorias_perm %>%
+  kable(caption = "Checklist: categorías explícitas del paper vs. nuestro propio término equivalente (Perm)",
+        digits = 6)
+```
+
+```{r}
+cat("Comparación directa del checklist:\n")
+cat("  JK:   ", sum(mapeo_categorias$recuperado),      "de", nrow(mapeo_categorias),      "\n")
+cat("  Perm: ", sum(mapeo_categorias_perm$recuperado), "de", nrow(mapeo_categorias_perm), "\n")
+```
+
+## 6.1. Celiac — Perm pierde por completo el eje mitótico
+
+```{r}
+comparacion_celiac_perm %>%
+  slice_head(n = 20) %>%
+  kable(caption = "Términos coincidentes con el paper, perfil Celiac (VIP+Perm)")
+```
+
+Aquí está la prueba definitiva de por qué Perm no se elige como criterio único: revisa la tabla — **no hay ni un solo término de ciclo celular, mitosis o división nuclear**. Perm sí recupera bien el eje de interferón (con genes propios como NLRC5, PARP9, HSP90B1), pero **AURKA, CCNB1, PLK1, MKI67 y el resto del módulo mitótico simplemente no pasaron el filtro de permutación** — se pierde por completo el segundo hallazgo central del paper, precisamente el que se valida por inmunohistoquímica.
+
+## 6.2. Control — empate técnico, Perm con un matiz propio
+
+```{r}
+comparacion_control_perm %>%
+  slice_head(n = 20) %>%
+  kable(caption = "Términos coincidentes con el paper, perfil Control (VIP+Perm)")
+```
+
+Aquí ambos criterios convergen bien en el núcleo lipídico/apolipoproteínas. Perm añade una capa propia de homeostasis y transporte de colesterol (CD36, RXRA, SOAT2, LIPA, GRAMD1B) algo más marcada que JK — aunque, como ya vimos en la sección 3, la mayoría de esos genes (CD36, LIPA, GRAMD1B) ya estaban en los 878 del paper, solo que sin destacar en el texto.
+
+## 6.3. Tabla comparativa final — justificación de la elección
+
+```{r}
+procesos_exclusivos_celiac_perm  <- procesos_nuevos(toppgene_perm, "Celiac",  kw_celiac)
+procesos_exclusivos_control_perm <- procesos_nuevos(toppgene_perm, "Control", kw_control)
+
+genes_celiac_entrada_perm  <- extraer_genes_entrada(toppgene_perm %>% filter(profile == "Celiac"))
+genes_control_entrada_perm <- extraer_genes_entrada(toppgene_perm %>% filter(profile == "Control"))
+
+genes_celiac_exclusivos_perm  <- setdiff(genes_celiac_entrada_perm,  paper_878$Gene)
+genes_control_exclusivos_perm <- setdiff(genes_control_entrada_perm, paper_878$Gene)
+
+comparacion_jk_vs_perm <- tibble(
+  metrica = c(
+    "Nº genes totales de entrada",
+    "Categorías explícitas del paper recuperadas (de 11)",
+    "Detalle ampliado, procesos coincidentes (Control)",
+    "Detalle ampliado, procesos coincidentes (Celiac)",
+    "Genes exclusivos, no en los 878 (Control)",
+    "Genes exclusivos, no en los 878 (Celiac)",
+    "Candidatos a proceso nuevo tras exclusión temática (Control)",
+    "Candidatos a proceso nuevo tras exclusión temática (Celiac)",
+    "Recupera eje mitosis/ciclo celular (Celiac)"
+  ),
+  JK = c(
+    "200 (69+131)",
+    as.character(sum(mapeo_categorias$recuperado)),
+    as.character(nrow(comparacion_control)),
+    as.character(nrow(comparacion_celiac)),
+    as.character(length(genes_control_exclusivos)),
+    as.character(length(genes_celiac_exclusivos)),
+    as.character(nrow(procesos_exclusivos_control)),
+    as.character(nrow(procesos_exclusivos_celiac)),
+    "Sí"
+  ),
+  Perm = c(
+    "123 (34+89)",
+    as.character(sum(mapeo_categorias_perm$recuperado)),
+    as.character(nrow(comparacion_control_perm)),
+    as.character(nrow(comparacion_celiac_perm)),
+    as.character(length(genes_control_exclusivos_perm)),
+    as.character(length(genes_celiac_exclusivos_perm)),
+    as.character(nrow(procesos_exclusivos_control_perm)),
+    as.character(nrow(procesos_exclusivos_celiac_perm)),
+    "No"
+  )
+)
+
+comparacion_jk_vs_perm %>%
+  kable(caption = "Comparación final JK vs Perm — justificación de la elección de JK como criterio definitivo")
+```
+
+**Conclusión**: se elige **VIP+Jack-knife** como criterio definitivo porque (1) da más genes en total, más cerca de los 878 del paper; y (2) es el único que recupera completamente el eje de proliferación/mitosis, validado experimentalmente por el paper mediante inmunohistoquímica (CCNB1, MKI67). Perm queda documentado como parte de la comparación de metodologías del TFG (uno de los objetivos explícitos del trabajo), no descartado sin argumentar — de hecho, aporta un matiz propio interesante en homeostasis del colesterol que merece mención en la discusión.
+

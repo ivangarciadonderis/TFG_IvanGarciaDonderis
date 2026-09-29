@@ -1,0 +1,8 @@
+metabolito,bacteria,p_perm,en_VIP,coeficiente
+Butanedioic.acid,Bacteroides_uniformis,0.024,TRUE,0.19649624769440735
+Butanedioic.acid,Bacteroides_fragilis,0.026,TRUE,0.22443078278390305
+Glucose..peak.1.,Bacteroides_acidifaciens,0.038,TRUE,0.25182500344730585
+Methionine,Bacteroides_fragilis,0.043,TRUE,0.20386034922662014
+Stearic.acid,Bacteroides_uniformis,0.013,TRUE,0.21029404712660452
+Stearic.acid,Alistipes_putredinis,0.031,TRUE,0.2793151297319274
+Stearic.acid,Akkermansia_muciniphila,0.047,TRUE,0.23273465646742267

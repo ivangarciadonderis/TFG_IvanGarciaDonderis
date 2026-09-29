@@ -1,0 +1,1609 @@
+---
+title: "PLS2 — Relación bacterias-metabolitos — Leonard et al. (2020)"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+date: "2026-07-24"
+---
+
+Este script relaciona bacterias (species) y metabolitos identificados como `EC_specific` en el análisis de LMM, mediante PLS2. Sigue el mismo plan acordado con la directora que en Leonard et al. (2021), aplicado a los dos modelos de este paper:
+
+1. Selección de bacterias y metabolitos significativos en el LMM correspondiente.
+2. PLS2 (X = bacterias, Y = metabolitos) con al menos 10 componentes.
+3. Selección del número definitivo de componentes (revisando el gráfico R²/Q² por componente; **la elección final del número de componentes de cada modelo queda pendiente de decisión propia**, revisando los gráficos generados).
+4. Gráficos de scores (coloreados por grupo, tiempo, país, sexo y modo de parto) y de loadings/weights, para identificar bacterias y metabolitos que actúan de forma coordinada.
+5. Significación de las relaciones bacteria-metabolito mediante los coeficientes de regresión del PLS2, comparando jackknife, permutación y VIP.
+6. Repetición del análisis por separado por subgrupo, para comprobar si la relación bacteria-metabolito cambia entre condiciones.
+7. Representación de las relaciones significativas como grafos bipartitos (`ggraph`/`tidygraph`) y como heatmaps.
+
+Se repite esta estructura una vez por modelo:
+
+- **Modelo 1 (exposición ambiental)**: restringido a infantes genéticamente predispuestos (`Genetic_Risk_Group != "Negative"`), igual que en el LMM. El split por subgrupo es `Exposed` vs `Not exposed`.
+- **Modelo 2 (riesgo genético)**: usa los 31 sujetos. El split por subgrupo es **`High` vs `Standard` vs `Negative`** — los 3 niveles de riesgo genético, tratados de forma simétrica (igual que en el LMM, donde `Standard` tiene el mismo peso que `High` en el criterio `EC_specific`). `High` (19 muestras) y `Negative` (14 muestras) tienen menos muestras que las 20 variables X; `Standard` (54 muestras) no. Confirmado con la directora que el objetivo de este análisis es **descriptivo, no predictivo**, por lo que esto no invalida el análisis en High/Negative — solo exige no interpretar su R²Y/Q² como medida de capacidad predictiva.
+
+# Carga de librerías
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(PLSandO)
+library(gridExtra)
+library(igraph)
+library(tidygraph)
+library(ggraph)
+library(here)
+
+processed_dir <- here("data", "processed", "leonard_2020")
+```
+
+## Funciones auxiliares de visualización de relaciones
+
+Se representan las relaciones bacteria-metabolito (permutación + VIP) como grafos bipartitos con `ggraph`/`tidygraph` (en vez de `igraph` base), porque reposiciona automáticamente las etiquetas para evitar solapes (`ggrepel`), igual que en los gráficos de loadings/weights del PLS.
+
+```{r}
+plot_bipartite_graph <- function(tabla, title, seed = 123) {
+  edges <- tabla %>% select(bacteria, metabolito)
+
+  g <- as_tbl_graph(graph_from_data_frame(edges, directed = FALSE)) %>%
+    activate(nodes) %>%
+    mutate(
+      type = name %in% unique(tabla$bacteria),
+      tipo = if_else(type, "Bacteria", "Metabolito")
+    )
+
+  set.seed(seed)
+  ggraph(g, layout = "bipartite") +
+    geom_edge_link(color = "grey70", alpha = 0.6) +
+    geom_node_point(aes(color = tipo, shape = tipo), size = 5) +
+    geom_node_text(aes(label = name), repel = TRUE, size = 3.3,
+                    max.overlaps = Inf, seed = seed) +
+    scale_color_manual(values = c("Bacteria" = "#3182bd", "Metabolito" = "#31a354")) +
+    labs(title = title, color = NULL, shape = NULL) +
+    theme_void() +
+    theme(legend.position = "bottom", plot.title = element_text(hjust = 0.5))
+}
+```
+
+Alternativa para cuando el grafo conjunto tiene demasiadas relaciones para leerse bien: dividir la tabla en bloques y graficar cada bloque por separado.
+
+```{r}
+plot_bipartite_graph_split <- function(tabla, title, block_size = 20, seed = 123) {
+  n_blocks <- ceiling(nrow(tabla) / block_size)
+  bloques <- split(tabla, ceiling(seq_len(nrow(tabla)) / block_size))
+
+  imap(bloques, function(sub_tabla, i) {
+    plot_bipartite_graph(sub_tabla, paste0(title, " (bloque ", i, "/", n_blocks, ")"), seed = seed)
+  })
+}
+```
+
+Alternativa: un panel pequeño por cada bacteria, mostrando solo sus metabolitos conectados.
+
+```{r}
+plot_star_by_bacteria <- function(tabla) {
+  bacterias <- sort(unique(tabla$bacteria))
+
+  plots <- map(bacterias, function(b) {
+    sub_tabla <- tabla %>% filter(bacteria == b)
+    edges <- sub_tabla %>% select(bacteria, metabolito)
+
+    g <- as_tbl_graph(graph_from_data_frame(edges, directed = FALSE)) %>%
+      activate(nodes) %>%
+      mutate(
+        type = name == b,
+        tipo = if_else(type, "Bacteria", "Metabolito")
+      )
+
+    ggraph(g, layout = "star") +
+      geom_edge_link(color = "grey70", alpha = 0.6) +
+      geom_node_point(aes(color = tipo, shape = tipo), size = 5) +
+      geom_node_text(aes(label = name), repel = TRUE, size = 4, max.overlaps = Inf) +
+      scale_color_manual(values = c("Bacteria" = "#3182bd", "Metabolito" = "#31a354")) +
+      labs(title = b) +
+      theme_void() +
+      theme(legend.position = "none", plot.title = element_text(size = 13, hjust = 0.5))
+  })
+
+  set_names(plots, bacterias)
+}
+```
+
+Alternativa a los grafos que no sufre el problema de solape de etiquetas: una matriz bacteria×metabolito coloreada por el coeficiente de regresión del PLS.
+
+```{r}
+plot_heatmap_relaciones <- function(tabla, title) {
+  ggplot(tabla, aes(x = metabolito, y = bacteria, fill = coeficiente)) +
+    geom_tile(color = "grey30", linewidth = 0.6) +
+    scale_fill_gradient2(low = "#08519c", mid = "white", high = "#a50f15",
+                          midpoint = 0, name = "Coeficiente\nPLS") +
+    scale_x_discrete(expand = c(0, 0)) +
+    scale_y_discrete(expand = c(0, 0)) +
+    labs(title = title, x = NULL, y = NULL,
+         caption = "Celdas en gris: sin relación seleccionada mediante permutación") +
+    theme_minimal() +
+    theme(
+      panel.grid = element_blank(),
+      panel.background = element_rect(fill = "grey88", color = NA),
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 8, face = "bold"),
+      axis.text.y = element_text(size = 9, face = "bold"),
+      plot.title = element_text(hjust = 0.5),
+      plot.caption = element_text(size = 8, hjust = 0, color = "grey40")
+    )
+}
+```
+
+---
+
+# MODELO 1 — Exposición ambiental
+
+## 1.1 Carga de datos y selección de variables EC-specific
+
+```{r}
+species_clr_data     <- readRDS(file.path(processed_dir, "species_clr_data.rds"))
+metabolites_log_data <- readRDS(file.path(processed_dir, "metabolites_log_data.rds"))
+
+species_model1_lmm_results     <- readRDS(file.path(processed_dir, "species_model1_lmm_results.rds"))
+metabolites_model1_lmm_results <- readRDS(file.path(processed_dir, "metabolites_model1_lmm_results.rds"))
+
+variables_species_model1     <- species_model1_lmm_results     %>% filter(EC_specific) %>% pull(variable)
+variables_metabolites_model1 <- metabolites_model1_lmm_results %>% filter(EC_specific) %>% pull(variable)
+
+cat("Species EC-specific (Modelo 1):    ", length(variables_species_model1), "\n")
+cat("Metabolitos EC-specific (Modelo 1):", length(variables_metabolites_model1), "\n")
+```
+
+## 1.2 Alineación de muestras (solo genéticamente predispuestos)
+
+```{r}
+species_key_model1 <- species_clr_data %>%
+  filter(Genetic_Risk_Group != "Negative") %>%
+  mutate(sample_key = paste(PaperID, time_point, sep = "_"))
+
+metabolites_key_model1 <- metabolites_log_data %>%
+  filter(Genetic_Risk_Group != "Negative") %>%
+  mutate(sample_key = paste(PaperID, time_point, sep = "_"))
+
+common_keys_model1 <- intersect(species_key_model1$sample_key, metabolites_key_model1$sample_key)
+
+cat("Muestras species:     ", nrow(species_key_model1), "\n")
+cat("Muestras metabolitos: ", nrow(metabolites_key_model1), "\n")
+cat("Muestras comunes:     ", length(common_keys_model1), "\n")
+
+species_aligned_model1     <- species_key_model1     %>% filter(sample_key %in% common_keys_model1) %>% arrange(sample_key)
+metabolites_aligned_model1 <- metabolites_key_model1 %>% filter(sample_key %in% common_keys_model1) %>% arrange(sample_key)
+
+identical(species_aligned_model1$sample_key, metabolites_aligned_model1$sample_key)
+```
+
+```{r}
+setdiff(species_key_model1$sample_key, metabolites_key_model1$sample_key)
+setdiff(metabolites_key_model1$sample_key, species_key_model1$sample_key)
+```
+
+## 1.3 Construcción de las matrices X (species) e Y (metabolitos)
+
+```{r}
+X_model1 <- species_aligned_model1     %>% select(all_of(variables_species_model1))     %>% as.data.frame()
+Y_model1 <- metabolites_aligned_model1 %>% select(all_of(variables_metabolites_model1)) %>% as.data.frame()
+
+rownames(X_model1) <- species_aligned_model1$sample_key
+rownames(Y_model1) <- metabolites_aligned_model1$sample_key
+
+cat("Filas X:", nrow(X_model1), "| Columnas X:", ncol(X_model1), "\n")
+cat("Filas Y:", nrow(Y_model1), "| Columnas Y:", ncol(Y_model1), "\n")
+```
+
+## 1.4 PLS2 — modelo conjunto (todas las muestras)
+
+### 1.4.1 Selección del número de componentes
+
+```{r}
+set.seed(123)
+
+modelo1_pls2 <- pls(
+  x        = X_model1,
+  y        = Y_model1,
+  ncomp    = 10,
+  cvFolds  = 5,
+  rep      = 10,
+  perm     = 100,
+  scaling  = "standard",
+  scalingY = "standard",
+  algo     = "nipals",
+  train    = 1,
+  parallel = FALSE
+)
+
+modelo1_pls2$summary
+```
+
+```{r}
+plsPlot(modelo1_pls2, type = "R2vsQ2") +
+  ggtitle("Modelo 1 (conjunto) — R² vs Q²")
+```
+
+**Revisar el gráfico anterior y fijar aquí el número definitivo de componentes** (criterio: codo en el R²Y individual por componente; el Q² no se usa como criterio de decisión, solo como referencia).
+
+```{r}
+ncomp_model1 <- 3 
+
+set.seed(123)
+
+modelo1_pls2 <- pls(
+  x        = X_model1,
+  y        = Y_model1,
+  ncomp    = ncomp_model1,
+  cvFolds  = 5,
+  rep      = 10,
+  perm     = 100,
+  scaling  = "standard",
+  scalingY = "standard",
+  algo     = "nipals",
+  train    = 1,
+  parallel = FALSE
+)
+
+modelo1_pls2$summary
+```
+
+### 1.4.2 Gráficos de scores
+
+Coloreados por exposición ambiental, tiempo, país, sexo y modo de parto, en comp1:2 y comp3:4 por separado.
+
+```{r}
+covar_exposure_model1 <- data.frame(Exposicion = species_aligned_model1$Exposure_to_Environmental_Factors)
+covar_time_model1     <- factor(species_aligned_model1$time_point,
+                                 levels = c("Enrollment", "3_months", "4_6_months"))
+covar_country_model1  <- data.frame(Country = species_aligned_model1$country)
+covar_gender_model1   <- data.frame(Gender = species_aligned_model1$Gender)
+covar_deliv_model1    <- data.frame(Delivery = species_aligned_model1$Delivery_Mode)
+```
+
+```{r}
+p1_exp_model1  <- plsPlot(modelo1_pls2, type = "scoresX", comp = 1:2, colBy = covar_exposure_model1, labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 1 (conjunto) — Scores X PC1-PC2 por exposición ambiental")
+p11_exp_model1 <- plsPlot(modelo1_pls2, type = "scoresX", comp = 2:3, colBy = covar_exposure_model1, labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 1 (conjunto) — Scores X PC2-PC3 por exposición ambiental")
+grid.arrange(p1_exp_model1, p11_exp_model1, ncol = 2)
+```
+
+```{r}
+p2_exp_model1  <- plsPlot(modelo1_pls2, type = "scoresY", comp = 1:2, colBy = covar_exposure_model1, labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 1 (conjunto) — Scores Y PC1-PC2 por exposición ambiental")
+p21_exp_model1 <- plsPlot(modelo1_pls2, type = "scoresY", comp = 2:3, colBy = covar_exposure_model1, labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 1 (conjunto) — Scores Y PC2-PC3 por exposición ambiental")
+grid.arrange(p2_exp_model1, p21_exp_model1, ncol = 2)
+```
+
+```{r}
+p1_time_model1  <- plsPlot(modelo1_pls2, type = "scoresX", comp = 1:2,
+                            colBy = data.frame(time_point = covar_time_model1), labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 1 (conjunto) — Scores X PC1-PC2 por tiempo")
+p11_time_model1 <- plsPlot(modelo1_pls2, type = "scoresX", comp = 2:3,
+                            colBy = data.frame(time_point = covar_time_model1), labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 1 (conjunto) — Scores X PC2-PC3 por tiempo")
+grid.arrange(p1_time_model1, p11_time_model1, ncol = 2)
+```
+
+```{r}
+p2_time_model1  <- plsPlot(modelo1_pls2, type = "scoresY", comp = 1:2,
+                            colBy = data.frame(time_point = covar_time_model1), labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 1 (conjunto) — Scores Y PC1-PC2 por tiempo")
+p21_time_model1 <- plsPlot(modelo1_pls2, type = "scoresY", comp = 2:3,
+                            colBy = data.frame(time_point = covar_time_model1), labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 1 (conjunto) — Scores Y PC2-PC3 por tiempo")
+grid.arrange(p2_time_model1, p21_time_model1, ncol = 2)
+```
+
+```{r}
+p1_country_model1  <- plsPlot(modelo1_pls2, type = "scoresX", comp = 1:2, colBy = covar_country_model1, labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 1 (conjunto) — Scores X PC1-PC2 por país")
+p11_country_model1 <- plsPlot(modelo1_pls2, type = "scoresX", comp = 2:3, colBy = covar_country_model1, labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 1 (conjunto) — Scores X PC2-PC3 por país")
+grid.arrange(p1_country_model1, p11_country_model1, ncol = 2)
+```
+
+```{r}
+p2_country_model1  <- plsPlot(modelo1_pls2, type = "scoresY", comp = 1:2, colBy = covar_country_model1, labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 1 (conjunto) — Scores Y PC1-PC2 por país")
+p21_country_model1 <- plsPlot(modelo1_pls2, type = "scoresY", comp = 2:3, colBy = covar_country_model1, labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 1 (conjunto) — Scores Y PC2-PC3 por país")
+grid.arrange(p2_country_model1, p21_country_model1, ncol = 2)
+```
+
+```{r}
+p1_gender_model1  <- plsPlot(modelo1_pls2, type = "scoresX", comp = 1:2, colBy = covar_gender_model1, labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 1 (conjunto) — Scores X PC1-PC2 por sexo")
+p11_gender_model1 <- plsPlot(modelo1_pls2, type = "scoresX", comp = 2:3, colBy = covar_gender_model1, labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 1 (conjunto) — Scores X PC2-PC3 por sexo")
+grid.arrange(p1_gender_model1, p11_gender_model1, ncol = 2)
+```
+
+```{r}
+p2_gender_model1  <- plsPlot(modelo1_pls2, type = "scoresY", comp = 1:2, colBy = covar_gender_model1, labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 1 (conjunto) — Scores Y PC1-PC2 por sexo")
+p21_gender_model1 <- plsPlot(modelo1_pls2, type = "scoresY", comp = 2:3, colBy = covar_gender_model1, labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 1 (conjunto) — Scores Y PC2-PC3 por sexo")
+grid.arrange(p2_gender_model1, p21_gender_model1, ncol = 2)
+```
+
+```{r}
+p1_deliv_model1  <- plsPlot(modelo1_pls2, type = "scoresX", comp = 1:2, colBy = covar_deliv_model1, labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 1 (conjunto) — Scores X PC1-PC2 por tipo de parto")
+p11_deliv_model1 <- plsPlot(modelo1_pls2, type = "scoresX", comp = 2:3, colBy = covar_deliv_model1, labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 1 (conjunto) — Scores X PC2-PC3 por tipo de parto")
+grid.arrange(p1_deliv_model1, p11_deliv_model1, ncol = 2)
+```
+
+```{r}
+p2_deliv_model1  <- plsPlot(modelo1_pls2, type = "scoresY", comp = 1:2, colBy = covar_deliv_model1, labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 1 (conjunto) — Scores Y PC1-PC2 por tipo de parto")
+p21_deliv_model1 <- plsPlot(modelo1_pls2, type = "scoresY", comp = 2:3, colBy = covar_deliv_model1, labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 1 (conjunto) — Scores Y PC2-PC3 por tipo de parto")
+grid.arrange(p2_deliv_model1, p21_deliv_model1, ncol = 2)
+```
+
+### 1.4.3 Gráficos de loadings
+
+```{r}
+p_loadX_model1  <- plsPlot(modelo1_pls2, type = "loadingsX", comp = 1:2, shape = "point", labels = FALSE, repel = TRUE) +
+  ggtitle("Modelo 1 (conjunto) — Loadings X PC1-PC2")
+p_loadY_model1  <- plsPlot(modelo1_pls2, type = "loadingsY", comp = 1:2, shape = "point", labels = FALSE, repel = TRUE) +
+  ggtitle("Modelo 1 (conjunto) — Loadings Y PC1-PC2")
+grid.arrange(p_loadX_model1, p_loadY_model1, ncol = 2)
+```
+
+```{r, fig.width=11, fig.height=8}
+plsPlot(modelo1_pls2, type = "loadingsX", comp = 1:2, shape = "point", labels = TRUE, repel = TRUE) +
+  ggtitle("Modelo 1 (conjunto) — Loadings X PC1-PC2")
+```
+
+```{r, fig.width=11, fig.height=8}
+plsPlot(modelo1_pls2, type = "loadingsY", comp = 1:2, shape = "point", labels = TRUE, repel = TRUE) +
+  ggtitle("Modelo 1 (conjunto) — Loadings Y PC1-PC2")
+```
+
+```{r}
+p_loadX1_model1 <- plsPlot(modelo1_pls2, type = "loadingsX", comp = 2:3, shape = "point", labels = FALSE, repel = TRUE) +
+  ggtitle("Modelo 1 (conjunto) — Loadings X PC2-PC3")
+p_loadY1_model1 <- plsPlot(modelo1_pls2, type = "loadingsY", comp = 2:3, shape = "point", labels = FALSE, repel = TRUE) +
+  ggtitle("Modelo 1 (conjunto) — Loadings Y PC2-PC3")
+grid.arrange(p_loadX1_model1, p_loadY1_model1, ncol = 2)
+```
+
+```{r, fig.width=11, fig.height=8}
+plsPlot(modelo1_pls2, type = "loadingsX", comp = 2:3, shape = "point", labels = TRUE, repel = TRUE) +
+  ggtitle("Modelo 1 (conjunto) — Loadings X PC2-PC3")
+```
+
+```{r, fig.width=11, fig.height=8}
+plsPlot(modelo1_pls2, type = "loadingsY", comp = 2:3, shape = "point", labels = TRUE, repel = TRUE) +
+  ggtitle("Modelo 1 (conjunto) — Loadings Y PC2-PC3")
+```
+
+### 1.4.4 Gráfico de weights
+
+```{r}
+plsPlot(modelo1_pls2, type = "weights", comp = 1:2, shape = "point", labels = FALSE, repel = TRUE) +
+  ggtitle("Modelo 1 (conjunto) — Weights PC1-PC2")
+```
+
+
+```{r}
+plsPlot(modelo1_pls2, type = "weights", comp = 2:3, shape = "point", labels = FALSE, repel = TRUE) +
+  ggtitle("Modelo 1 (conjunto) — Weights PC2-PC3")
+```
+
+Versión con etiquetas :
+
+```{r, fig.width=11, fig.height=8}
+plsPlot(modelo1_pls2, type = "weights", comp = 1:2,shape = "point", labels = TRUE, repel = TRUE) +
+  ggtitle("Modelo 1 (conjunto) — Weights PC1-PC2")
+```
+
+```{r, fig.width=11, fig.height=8}
+plsPlot(modelo1_pls2, type = "weights", comp = 2:3, shape = "point", labels = TRUE, repel = TRUE) +
+  ggtitle("Modelo 1 (conjunto) — Weights PC2-PC3")
+```
+
+### 1.4.5 Significación de las relaciones bacteria-metabolito
+
+```{r, fig.show='hide'}
+set.seed(123)
+
+jack_model1 <- plsVarSel(modelo1_pls2, type = "Jack", rep = 100, threshold = 0.05)
+perm_model1 <- plsVarSel(modelo1_pls2, type = "Perm", rep = 1000, threshold = 0.05)
+vip_model1  <- plsVarSel(modelo1_pls2, type = "VIP")
+```
+
+```{r}
+cat("Metabolitos con alguna bacteria significativa (Jack):", sum(sapply(jack_model1, nrow) > 0), "\n")
+cat("Metabolitos con alguna bacteria significativa (Perm):", sum(sapply(perm_model1, nrow) > 0), "\n")
+cat("Relaciones totales (Jack):", sum(sapply(jack_model1, nrow)), "\n")
+cat("Relaciones totales (Perm):", sum(sapply(perm_model1, nrow)), "\n")
+cat("Bacterias con VIP > 1:", nrow(vip_model1), "\n")
+```
+
+```{r}
+bacterias_perm_model1 <- perm_model1 %>%
+  discard(~ nrow(.x) == 0) %>%
+  map(rownames) %>%
+  unlist() %>%
+  unique()
+
+intersect(rownames(vip_model1), bacterias_perm_model1)
+```
+
+```{r}
+perm_no_vacios_model1 <- perm_model1[sapply(perm_model1, nrow) > 0]
+
+tabla_relaciones_model1 <- perm_no_vacios_model1 %>%
+  imap_dfr(~ tibble(
+    metabolito = .y,
+    bacteria   = rownames(.x),
+    p_perm     = .x$pValPerm
+  )) %>%
+  mutate(en_VIP = bacteria %in% rownames(vip_model1)) %>%
+  mutate(coeficiente = modelo1_pls2$coefficients[cbind(bacteria, metabolito)]) %>%
+  arrange(metabolito, p_perm)
+
+tabla_relaciones_model1
+```
+
+```{r}
+write_csv(tabla_relaciones_model1, file.path(processed_dir, "relaciones_bacteria_metabolito_model1_perm.csv"))
+```
+
+## 1.5 PLS2 separado por subgrupo (Expuesto vs. No expuesto)
+
+Se repite el análisis completo por separado para expuestos y no-expuestos, para comprobar si la relación bacteria-metabolito cambia entre condiciones — esperable, ya que las variables de entrada se seleccionaron precisamente por su asociación con la exposición ambiental en el LMM.
+
+### 1.5.1 División de las muestras por subgrupo
+
+```{r}
+species_exposed_model1     <- species_aligned_model1     %>% filter(Exposure_to_Environmental_Factors == "Exposed")
+species_notexposed_model1  <- species_aligned_model1     %>% filter(Exposure_to_Environmental_Factors == "Not exposed")
+
+metabolites_exposed_model1    <- metabolites_aligned_model1 %>% filter(Exposure_to_Environmental_Factors == "Exposed")
+metabolites_notexposed_model1 <- metabolites_aligned_model1 %>% filter(Exposure_to_Environmental_Factors == "Not exposed")
+
+cat("Muestras Expuestos:    ", nrow(species_exposed_model1), "\n")
+cat("Muestras No expuestos: ", nrow(species_notexposed_model1), "\n")
+```
+
+```{r}
+identical(species_exposed_model1$sample_key, metabolites_exposed_model1$sample_key)
+identical(species_notexposed_model1$sample_key, metabolites_notexposed_model1$sample_key)
+```
+
+```{r}
+X_exposed_model1 <- species_exposed_model1 %>% select(all_of(variables_species_model1)) %>% as.data.frame()
+Y_exposed_model1 <- metabolites_exposed_model1 %>% select(all_of(variables_metabolites_model1)) %>% as.data.frame()
+rownames(X_exposed_model1) <- species_exposed_model1$sample_key
+rownames(Y_exposed_model1) <- metabolites_exposed_model1$sample_key
+
+X_notexposed_model1 <- species_notexposed_model1 %>% select(all_of(variables_species_model1)) %>% as.data.frame()
+Y_notexposed_model1 <- metabolites_notexposed_model1 %>% select(all_of(variables_metabolites_model1)) %>% as.data.frame()
+rownames(X_notexposed_model1) <- species_notexposed_model1$sample_key
+rownames(Y_notexposed_model1) <- metabolites_notexposed_model1$sample_key
+
+cat("Expuestos:    X", dim(X_exposed_model1), " Y", dim(Y_exposed_model1), "\n")
+cat("No expuestos: X", dim(X_notexposed_model1), " Y", dim(Y_notexposed_model1), "\n")
+```
+
+### 1.5.2 Selección del número de componentes (por subgrupo)
+
+#### Ajuste exploratorio (ncomp = 10)
+
+```{r}
+set.seed(123)
+modelo1_exposed <- pls(
+  x = X_exposed_model1, y = Y_exposed_model1, ncomp = 10,
+  cvFolds = 5, rep = 10, perm = 100,
+  scaling = "standard", scalingY = "standard",
+  algo = "nipals", train = 1, parallel = FALSE
+)
+
+set.seed(123)
+modelo1_notexposed <- pls(
+  x = X_notexposed_model1, y = Y_notexposed_model1, ncomp = 10,
+  cvFolds = 5, rep = 10, perm = 100,
+  scaling = "standard", scalingY = "standard",
+  algo = "nipals", train = 1, parallel = FALSE
+)
+```
+
+#### Expuestos
+
+```{r}
+modelo1_exposed$summary
+```
+
+```{r}
+plsPlot(modelo1_exposed, type = "R2vsQ2") +
+  ggtitle("Modelo 1 (Expuestos) — R² vs Q²")
+```
+
+#### No expuestos
+
+```{r}
+modelo1_notexposed$summary
+```
+
+
+
+
+```{r}
+plsPlot(modelo1_notexposed, type = "R2vsQ2") +
+  ggtitle("Modelo 1 (No expuestos) — R² vs Q²")
+```
+
+#### Reajuste con el nº de componentes definitivo
+
+```{r}
+ncomp_model1_exposed    <- 4 
+ncomp_model1_notexposed <- 2
+
+set.seed(123)
+modelo1_exposed <- pls(
+  x = X_exposed_model1, y = Y_exposed_model1, ncomp = ncomp_model1_exposed,
+  cvFolds = 5, rep = 10, perm = 100,
+  scaling = "standard", scalingY = "standard",
+  algo = "nipals", train = 1, parallel = FALSE
+)
+
+set.seed(123)
+modelo1_notexposed <- pls(
+  x = X_notexposed_model1, y = Y_notexposed_model1, ncomp = ncomp_model1_notexposed,
+  cvFolds = 5, rep = 10, perm = 100,
+  scaling = "standard", scalingY = "standard",
+  algo = "nipals", train = 1, parallel = FALSE
+)
+```
+
+**Expuestos** (`ncomp = 4`)
+
+```{r}
+modelo1_exposed$summary
+```
+
+**No expuestos** (`ncomp = 2`)
+
+```{r}
+modelo1_notexposed$summary
+```
+
+### 1.5.3 Gráficos exploratorios por subgrupo
+
+Coloreados solo por tiempo, ya que cada modelo contiene un único nivel de exposición.
+
+#### Expuestos
+
+```{r}
+covar_time_exposed_model1 <- factor(species_exposed_model1$time_point,
+                                     levels = c("Enrollment", "3_months", "4_6_months"))
+
+p1_exposed <- plsPlot(modelo1_exposed, type = "scoresX", comp = 1:2,
+                       colBy = data.frame(time_point = covar_time_exposed_model1),
+                       labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 1 (Expuestos) — Scores X PC1-PC2 por tiempo")
+
+p2_exposed <- plsPlot(modelo1_exposed, type = "scoresY", comp = 1:2,
+                       colBy = data.frame(time_point = covar_time_exposed_model1),
+                       labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 1 (Expuestos) — Scores Y PC1-PC2 por tiempo")
+
+grid.arrange(p1_exposed, p2_exposed, ncol = 2)
+```
+
+```{r}
+p_loadX_exposed <- plsPlot(modelo1_exposed, type = "loadingsX", comp = 1:2, shape = "point", labels = FALSE, repel = TRUE) +
+  ggtitle("Modelo 1 (Expuestos) — Loadings X PC1-PC2")
+p_loadY_exposed <- plsPlot(modelo1_exposed, type = "loadingsY", comp = 1:2, shape = "point", labels = FALSE, repel = TRUE) +
+  ggtitle("Modelo 1 (Expuestos) — Loadings Y PC1-PC2")
+grid.arrange(p_loadX_exposed, p_loadY_exposed, ncol = 2)
+```
+
+```{r, fig.width=11, fig.height=8}
+plsPlot(modelo1_exposed, type = "loadingsX", comp = 1:2, shape = "point", labels = TRUE, repel = TRUE) +
+  ggtitle("Modelo 1 (Expuestos) — Loadings X PC1-PC2")
+```
+
+```{r, fig.width=11, fig.height=8}
+plsPlot(modelo1_exposed, type = "loadingsY", comp = 1:2, shape = "point", labels = TRUE, repel = TRUE) +
+  ggtitle("Modelo 1 (Expuestos) — Loadings Y PC1-PC2")
+```
+
+```{r}
+plsPlot(modelo1_exposed, type = "weights", comp = 1:2, labels = FALSE, shape = "point", repel = TRUE) +
+  ggtitle("Modelo 1 (Expuestos) — Weights PC1-PC2")
+```
+
+```{r, fig.width=11, fig.height=8}
+plsPlot(modelo1_exposed, type = "weights", comp = 1:2, labels = TRUE, shape = "point", repel = TRUE) +
+  ggtitle("Modelo 1 (Expuestos) — Weights PC1-PC2")
+```
+
+#### No expuestos
+
+```{r}
+covar_time_notexposed_model1 <- factor(species_notexposed_model1$time_point,
+                                        levels = c("Enrollment", "3_months", "4_6_months"))
+
+p1_notexposed <- plsPlot(modelo1_notexposed, type = "scoresX", comp = 1:2,
+                          colBy = data.frame(time_point = covar_time_notexposed_model1),
+                          labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 1 (No expuestos) — Scores X PC1-PC2 por tiempo")
+
+p2_notexposed <- plsPlot(modelo1_notexposed, type = "scoresY", comp = 1:2,
+                          colBy = data.frame(time_point = covar_time_notexposed_model1),
+                          labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 1 (No expuestos) — Scores Y PC1-PC2 por tiempo")
+
+grid.arrange(p1_notexposed, p2_notexposed, ncol = 2)
+```
+
+```{r}
+p_loadX_notexposed <- plsPlot(modelo1_notexposed, type = "loadingsX", comp = 1:2, shape = "point", labels = FALSE, repel = TRUE) +
+  ggtitle("Modelo 1 (No expuestos) — Loadings X PC1-PC2")
+p_loadY_notexposed <- plsPlot(modelo1_notexposed, type = "loadingsY", comp = 1:2, shape = "point", labels = FALSE, repel = TRUE) +
+  ggtitle("Modelo 1 (No expuestos) — Loadings Y PC1-PC2")
+grid.arrange(p_loadX_notexposed, p_loadY_notexposed, ncol = 2)
+```
+
+```{r, fig.width=11, fig.height=8}
+plsPlot(modelo1_notexposed, type = "loadingsX", comp = 1:2, shape = "point", labels = TRUE, repel = TRUE) +
+  ggtitle("Modelo 1 (No expuestos) — Loadings X PC1-PC2")
+```
+
+```{r, fig.width=11, fig.height=8}
+plsPlot(modelo1_notexposed, type = "loadingsY", comp = 1:2, shape = "point", labels = TRUE, repel = TRUE) +
+  ggtitle("Modelo 1 (No expuestos) — Loadings Y PC1-PC2")
+```
+
+```{r}
+plsPlot(modelo1_notexposed, type = "weights", comp = 1:2, labels = FALSE, shape = "point", repel = TRUE) +
+  ggtitle("Modelo 1 (No expuestos) — Weights PC1-PC2")
+```
+
+```{r, fig.width=11, fig.height=8}
+plsPlot(modelo1_notexposed, type = "weights", comp = 1:2, labels = TRUE, shape = "point", repel = TRUE) +
+  ggtitle("Modelo 1 (No expuestos) — Weights PC1-PC2")
+```
+
+### 1.5.4 Significación de relaciones bacteria-metabolito, por subgrupo
+
+#### Ajuste (Jackknife / Permutación / VIP)
+
+```{r, fig.show='hide'}
+set.seed(123)
+jack_exposed <- plsVarSel(modelo1_exposed, type = "Jack", rep = 100, threshold = 0.05)
+perm_exposed <- plsVarSel(modelo1_exposed, type = "Perm", rep = 1000, threshold = 0.05)
+vip_exposed  <- plsVarSel(modelo1_exposed, type = "VIP")
+
+set.seed(123)
+jack_notexposed <- plsVarSel(modelo1_notexposed, type = "Jack", rep = 100, threshold = 0.05)
+perm_notexposed <- plsVarSel(modelo1_notexposed, type = "Perm", rep = 1000, threshold = 0.05)
+vip_notexposed  <- plsVarSel(modelo1_notexposed, type = "VIP")
+```
+
+#### Resumen de conteos por subgrupo
+
+```{r, fig.show='hide'}
+cat("Expuestos    - Jack:", sum(sapply(jack_exposed, nrow) > 0), " Perm:", sum(sapply(perm_exposed, nrow) > 0), " VIP:", nrow(vip_exposed), "\n")
+cat("No expuestos - Jack:", sum(sapply(jack_notexposed, nrow) > 0), " Perm:", sum(sapply(perm_notexposed, nrow) > 0), " VIP:", nrow(vip_notexposed), "\n")
+```
+
+#### Tabla de relaciones — Expuestos
+
+```{r}
+tabla_exposed_model1 <- perm_exposed[sapply(perm_exposed, nrow) > 0] %>%
+  imap_dfr(~ tibble(
+    metabolito = .y,
+    bacteria   = rownames(.x),
+    p_perm     = .x$pValPerm
+  )) %>%
+  mutate(en_VIP = bacteria %in% rownames(vip_exposed)) %>%
+  mutate(coeficiente = modelo1_exposed$coefficients[cbind(bacteria, metabolito)]) %>%
+  arrange(metabolito, p_perm)
+
+tabla_notexposed_model1 <- perm_notexposed[sapply(perm_notexposed, nrow) > 0] %>%
+  imap_dfr(~ tibble(
+    metabolito = .y,
+    bacteria   = rownames(.x),
+    p_perm     = .x$pValPerm
+  )) %>%
+  mutate(en_VIP = bacteria %in% rownames(vip_notexposed)) %>%
+  mutate(coeficiente = modelo1_notexposed$coefficients[cbind(bacteria, metabolito)]) %>%
+  arrange(metabolito, p_perm)
+
+tabla_exposed_model1
+```
+
+#### Tabla de relaciones — No expuestos
+
+```{r}
+tabla_notexposed_model1
+```
+
+```{r}
+write_csv(tabla_exposed_model1,    file.path(processed_dir, "relaciones_bacteria_metabolito_model1_exposed.csv"))
+write_csv(tabla_notexposed_model1, file.path(processed_dir, "relaciones_bacteria_metabolito_model1_notexposed.csv"))
+```
+
+### 1.5.5 Comparación Expuesto vs. No expuesto
+
+```{r}
+pares_exposed_model1    <- paste(tabla_exposed_model1$bacteria, tabla_exposed_model1$metabolito, sep = "__")
+pares_notexposed_model1 <- paste(tabla_notexposed_model1$bacteria, tabla_notexposed_model1$metabolito, sep = "__")
+
+cat("Relaciones solo en Expuestos:    ", length(setdiff(pares_exposed_model1, pares_notexposed_model1)), "\n")
+cat("Relaciones solo en No expuestos: ", length(setdiff(pares_notexposed_model1, pares_exposed_model1)), "\n")
+cat("Relaciones en ambos:             ", length(intersect(pares_exposed_model1, pares_notexposed_model1)), "\n")
+
+cat("\nBacterias en Expuestos:    ", paste(sort(unique(tabla_exposed_model1$bacteria)), collapse = ", "), "\n")
+cat("Bacterias en No expuestos: ", paste(sort(unique(tabla_notexposed_model1$bacteria)), collapse = ", "), "\n")
+```
+
+```{r}
+intersect(pares_exposed_model1, pares_notexposed_model1)
+```
+
+## 1.6 Grafos — Modelo 1
+
+```{r, fig.width=11, fig.height=9}
+plot_bipartite_graph(tabla_relaciones_model1, "Relaciones bacteria-metabolito — Modelo 1 (conjunto)")
+```
+
+```{r, fig.width=7, fig.height=6}
+walk(plot_star_by_bacteria(tabla_relaciones_model1), print)
+```
+
+```{r, fig.width=11, fig.height=9}
+plot_bipartite_graph(tabla_exposed_model1, "Modelo 1 — Expuestos")
+```
+
+```{r, fig.width=7, fig.height=6}
+walk(plot_star_by_bacteria(tabla_exposed_model1), print)
+```
+
+```{r, fig.width=11, fig.height=9}
+plot_bipartite_graph(tabla_notexposed_model1, "Modelo 1 — No expuestos")
+```
+
+```{r, fig.width=7, fig.height=6}
+walk(plot_star_by_bacteria(tabla_notexposed_model1), print)
+```
+
+## 1.7 Heatmaps — Modelo 1
+
+```{r, fig.width=11, fig.height=6}
+plot_heatmap_relaciones(tabla_relaciones_model1, "Relaciones bacteria-metabolito — Modelo 1 (conjunto)")
+```
+
+```{r, fig.width=11, fig.height=6}
+plot_heatmap_relaciones(tabla_exposed_model1, "Modelo 1 — Expuestos")
+```
+
+```{r, fig.width=11, fig.height=6}
+plot_heatmap_relaciones(tabla_notexposed_model1, "Modelo 1 — No expuestos")
+```
+
+---
+
+# MODELO 2 — Riesgo genético
+
+## 2.1 Carga de datos y selección de variables EC-specific
+
+```{r}
+species_model2_lmm_results     <- readRDS(file.path(processed_dir, "species_model2_lmm_results.rds"))
+metabolites_model2_lmm_results <- readRDS(file.path(processed_dir, "metabolites_model2_lmm_results.rds"))
+
+variables_species_model2     <- species_model2_lmm_results     %>% filter(EC_specific) %>% pull(variable)
+variables_metabolites_model2 <- metabolites_model2_lmm_results %>% filter(EC_specific) %>% pull(variable)
+
+cat("Species EC-specific (Modelo 2):    ", length(variables_species_model2), "\n")
+cat("Metabolitos EC-specific (Modelo 2):", length(variables_metabolites_model2), "\n")
+```
+
+## 2.2 Alineación de muestras (31 sujetos)
+
+```{r}
+species_key_model2 <- species_clr_data %>%
+  mutate(sample_key = paste(PaperID, time_point, sep = "_"))
+
+metabolites_key_model2 <- metabolites_log_data %>%
+  mutate(sample_key = paste(PaperID, time_point, sep = "_"))
+
+common_keys_model2 <- intersect(species_key_model2$sample_key, metabolites_key_model2$sample_key)
+
+cat("Muestras species:     ", nrow(species_key_model2), "\n")
+cat("Muestras metabolitos: ", nrow(metabolites_key_model2), "\n")
+cat("Muestras comunes:     ", length(common_keys_model2), "\n")
+
+species_aligned_model2     <- species_key_model2     %>% filter(sample_key %in% common_keys_model2) %>% arrange(sample_key)
+metabolites_aligned_model2 <- metabolites_key_model2 %>% filter(sample_key %in% common_keys_model2) %>% arrange(sample_key)
+
+identical(species_aligned_model2$sample_key, metabolites_aligned_model2$sample_key)
+```
+
+```{r}
+setdiff(species_key_model2$sample_key, metabolites_key_model2$sample_key)
+setdiff(metabolites_key_model2$sample_key, species_key_model2$sample_key)
+```
+
+## 2.3 Construcción de las matrices X (species) e Y (metabolitos)
+
+```{r}
+X_model2 <- species_aligned_model2     %>% select(all_of(variables_species_model2))     %>% as.data.frame()
+Y_model2 <- metabolites_aligned_model2 %>% select(all_of(variables_metabolites_model2)) %>% as.data.frame()
+
+rownames(X_model2) <- species_aligned_model2$sample_key
+rownames(Y_model2) <- metabolites_aligned_model2$sample_key
+
+cat("Filas X:", nrow(X_model2), "| Columnas X:", ncol(X_model2), "\n")
+cat("Filas Y:", nrow(Y_model2), "| Columnas Y:", ncol(Y_model2), "\n")
+```
+
+## 2.4 PLS2 — modelo conjunto (todas las muestras)
+
+### 2.4.1 Selección del número de componentes
+
+```{r}
+set.seed(123)
+
+modelo2_pls2 <- pls(
+  x        = X_model2,
+  y        = Y_model2,
+  ncomp    = 10,
+  cvFolds  = 5,
+  rep      = 10,
+  perm     = 100,
+  scaling  = "standard",
+  scalingY = "standard",
+  algo     = "nipals",
+  train    = 1,
+  parallel = FALSE
+)
+
+modelo2_pls2$summary
+```
+
+```{r}
+plsPlot(modelo2_pls2, type = "R2vsQ2") +
+  ggtitle("Modelo 2 (conjunto) — R² vs Q²")
+```
+
+
+```{r}
+ncomp_model2 <- 4 
+
+set.seed(123)
+
+modelo2_pls2 <- pls(
+  x        = X_model2,
+  y        = Y_model2,
+  ncomp    = ncomp_model2,
+  cvFolds  = 5,
+  rep      = 10,
+  perm     = 100,
+  scaling  = "standard",
+  scalingY = "standard",
+  algo     = "nipals",
+  train    = 1,
+  parallel = FALSE
+)
+
+modelo2_pls2$summary
+```
+
+### 2.4.2 Gráficos de scores
+
+Coloreados por riesgo genético, exposición ambiental, tiempo, país, sexo y modo de parto, en comp1:2 y comp3:4 por separado.
+
+```{r}
+covar_risk_model2    <- data.frame(Riesgo = species_aligned_model2$Genetic_Risk_Group)
+covar_exp_model2     <- data.frame(Exposicion = species_aligned_model2$Exposure_to_Environmental_Factors)
+covar_time_model2    <- factor(species_aligned_model2$time_point,
+                                levels = c("Enrollment", "3_months", "4_6_months"))
+covar_country_model2 <- data.frame(Country = species_aligned_model2$country)
+covar_gender_model2  <- data.frame(Gender = species_aligned_model2$Gender)
+covar_deliv_model2   <- data.frame(Delivery = species_aligned_model2$Delivery_Mode)
+```
+
+```{r}
+p1_risk_model2  <- plsPlot(modelo2_pls2, type = "scoresX", comp = 1:2, colBy = covar_risk_model2, labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 2 (conjunto) — Scores X PC1-PC2 por riesgo genético (HLA)")
+p11_risk_model2 <- plsPlot(modelo2_pls2, type = "scoresX", comp = 3:4, colBy = covar_risk_model2, labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 2 (conjunto) — Scores X PC3-PC4 por riesgo genético (HLA)")
+grid.arrange(p1_risk_model2, p11_risk_model2, ncol = 2)
+```
+
+```{r}
+p2_risk_model2  <- plsPlot(modelo2_pls2, type = "scoresY", comp = 1:2, colBy = covar_risk_model2, labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 2 (conjunto) — Scores Y PC1-PC2 por riesgo genético (HLA)")
+p21_risk_model2 <- plsPlot(modelo2_pls2, type = "scoresY", comp = 3:4, colBy = covar_risk_model2, labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 2 (conjunto) — Scores Y PC3-PC4 por riesgo genético (HLA)")
+grid.arrange(p2_risk_model2, p21_risk_model2, ncol = 2)
+```
+
+```{r}
+p1_exp_model2  <- plsPlot(modelo2_pls2, type = "scoresX", comp = 1:2, colBy = covar_exp_model2, labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 2 (conjunto) — Scores X PC1-PC2 por exposición ambiental")
+p11_exp_model2 <- plsPlot(modelo2_pls2, type = "scoresX", comp = 3:4, colBy = covar_exp_model2, labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 2 (conjunto) — Scores X PC3-PC4 por exposición ambiental")
+grid.arrange(p1_exp_model2, p11_exp_model2, ncol = 2)
+```
+
+```{r}
+p2_exp_model2  <- plsPlot(modelo2_pls2, type = "scoresY", comp = 1:2, colBy = covar_exp_model2, labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 2 (conjunto) — Scores Y PC1-PC2 por exposición ambiental")
+p21_exp_model2 <- plsPlot(modelo2_pls2, type = "scoresY", comp = 3:4, colBy = covar_exp_model2, labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 2 (conjunto) — Scores Y PC3-PC4 por exposición ambiental")
+grid.arrange(p2_exp_model2, p21_exp_model2, ncol = 2)
+```
+
+```{r}
+p1_time_model2  <- plsPlot(modelo2_pls2, type = "scoresX", comp = 1:2,
+                            colBy = data.frame(time_point = covar_time_model2), labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 2 (conjunto) — Scores X PC1-PC2 por tiempo")
+p11_time_model2 <- plsPlot(modelo2_pls2, type = "scoresX", comp = 3:4,
+                            colBy = data.frame(time_point = covar_time_model2), labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 2 (conjunto) — Scores X PC3-PC4 por tiempo")
+grid.arrange(p1_time_model2, p11_time_model2, ncol = 2)
+```
+
+```{r}
+p2_time_model2  <- plsPlot(modelo2_pls2, type = "scoresY", comp = 1:2,
+                            colBy = data.frame(time_point = covar_time_model2), labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 2 (conjunto) — Scores Y PC1-PC2 por tiempo")
+p21_time_model2 <- plsPlot(modelo2_pls2, type = "scoresY", comp = 3:4,
+                            colBy = data.frame(time_point = covar_time_model2), labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 2 (conjunto) — Scores Y PC3-PC4 por tiempo")
+grid.arrange(p2_time_model2, p21_time_model2, ncol = 2)
+```
+
+```{r}
+p1_country_model2  <- plsPlot(modelo2_pls2, type = "scoresX", comp = 1:2, colBy = covar_country_model2, labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 2 (conjunto) — Scores X PC1-PC2 por país")
+p11_country_model2 <- plsPlot(modelo2_pls2, type = "scoresX", comp = 3:4, colBy = covar_country_model2, labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 2 (conjunto) — Scores X PC3-PC4 por país")
+grid.arrange(p1_country_model2, p11_country_model2, ncol = 2)
+```
+
+```{r}
+p2_country_model2  <- plsPlot(modelo2_pls2, type = "scoresY", comp = 1:2, colBy = covar_country_model2, labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 2 (conjunto) — Scores Y PC1-PC2 por país")
+p21_country_model2 <- plsPlot(modelo2_pls2, type = "scoresY", comp = 3:4, colBy = covar_country_model2, labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 2 (conjunto) — Scores Y PC3-PC4 por país")
+grid.arrange(p2_country_model2, p21_country_model2, ncol = 2)
+```
+
+```{r}
+p1_gender_model2  <- plsPlot(modelo2_pls2, type = "scoresX", comp = 1:2, colBy = covar_gender_model2, labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 2 (conjunto) — Scores X PC1-PC2 por sexo")
+p11_gender_model2 <- plsPlot(modelo2_pls2, type = "scoresX", comp = 3:4, colBy = covar_gender_model2, labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 2 (conjunto) — Scores X PC3-PC4 por sexo")
+grid.arrange(p1_gender_model2, p11_gender_model2, ncol = 2)
+```
+
+```{r}
+p2_gender_model2  <- plsPlot(modelo2_pls2, type = "scoresY", comp = 1:2, colBy = covar_gender_model2, labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 2 (conjunto) — Scores Y PC1-PC2 por sexo")
+p21_gender_model2 <- plsPlot(modelo2_pls2, type = "scoresY", comp = 3:4, colBy = covar_gender_model2, labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 2 (conjunto) — Scores Y PC3-PC4 por sexo")
+grid.arrange(p2_gender_model2, p21_gender_model2, ncol = 2)
+```
+
+```{r}
+p1_deliv_model2  <- plsPlot(modelo2_pls2, type = "scoresX", comp = 1:2, colBy = covar_deliv_model2, labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 2 (conjunto) — Scores X PC1-PC2 por tipo de parto")
+p11_deliv_model2 <- plsPlot(modelo2_pls2, type = "scoresX", comp = 3:4, colBy = covar_deliv_model2, labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 2 (conjunto) — Scores X PC3-PC4 por tipo de parto")
+grid.arrange(p1_deliv_model2, p11_deliv_model2, ncol = 2)
+```
+
+```{r}
+p2_deliv_model2  <- plsPlot(modelo2_pls2, type = "scoresY", comp = 1:2, colBy = covar_deliv_model2, labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 2 (conjunto) — Scores Y PC1-PC2 por tipo de parto")
+p21_deliv_model2 <- plsPlot(modelo2_pls2, type = "scoresY", comp = 3:4, colBy = covar_deliv_model2, labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 2 (conjunto) — Scores Y PC3-PC4 por tipo de parto")
+grid.arrange(p2_deliv_model2, p21_deliv_model2, ncol = 2)
+```
+
+### 2.4.3 Gráficos de loadings
+
+```{r}
+p_loadX_model2 <- plsPlot(modelo2_pls2, type = "loadingsX", comp = 1:2, shape = "point", labels = FALSE, repel = TRUE) +
+  ggtitle("Modelo 2 (conjunto) — Loadings X PC1-PC2")
+p_loadY_model2 <- plsPlot(modelo2_pls2, type = "loadingsY", comp = 1:2, shape = "point", labels = FALSE, repel = TRUE) +
+  ggtitle("Modelo 2 (conjunto) — Loadings Y PC1-PC2")
+grid.arrange(p_loadX_model2, p_loadY_model2, ncol = 2)
+```
+
+```{r, fig.width=11, fig.height=8}
+plsPlot(modelo2_pls2, type = "loadingsX", comp = 1:2, shape = "point", labels = TRUE, repel = TRUE) +
+  ggtitle("Modelo 2 (conjunto) — Loadings X PC1-PC2")
+```
+
+```{r, fig.width=11, fig.height=8}
+plsPlot(modelo2_pls2, type = "loadingsY", comp = 1:2, shape = "point", labels = TRUE, repel = TRUE) +
+  ggtitle("Modelo 2 (conjunto) — Loadings Y PC1-PC2")
+```
+
+```{r}
+p_loadX1_model2 <- plsPlot(modelo2_pls2, type = "loadingsX", comp = 3:4, shape = "point", labels = FALSE, repel = TRUE) +
+  ggtitle("Modelo 2 (conjunto) — Loadings X PC3-PC4")
+p_loadY1_model2 <- plsPlot(modelo2_pls2, type = "loadingsY", comp = 3:4, shape = "point", labels = FALSE, repel = TRUE) +
+  ggtitle("Modelo 2 (conjunto) — Loadings Y PC3-PC4")
+grid.arrange(p_loadX1_model2, p_loadY1_model2, ncol = 2)
+```
+
+```{r, fig.width=11, fig.height=8}
+plsPlot(modelo2_pls2, type = "loadingsX", comp = 3:4, shape = "point", labels = TRUE, repel = TRUE) +
+  ggtitle("Modelo 2 (conjunto) — Loadings X PC3-PC4")
+```
+
+```{r, fig.width=11, fig.height=8}
+plsPlot(modelo2_pls2, type = "loadingsY", comp = 3:4, shape = "point", labels = TRUE, repel = TRUE) +
+  ggtitle("Modelo 2 (conjunto) — Loadings Y PC3-PC4")
+```
+
+### 2.4.4 Gráfico de weights
+
+```{r}
+plsPlot(modelo2_pls2, type = "weights", comp = 1:2, shape = "point", labels = FALSE, repel = TRUE) +
+  ggtitle("Modelo 2 (conjunto) — Weights PC1-PC2")
+```
+
+
+```{r}
+plsPlot(modelo2_pls2, type = "weights", comp = 3:4, shape = "point", labels = FALSE, repel = TRUE) +
+  ggtitle("Modelo 2 (conjunto) — Weights PC3-PC4")
+```
+
+```{r, fig.width=11, fig.height=8}
+plsPlot(modelo2_pls2, type = "weights", comp = 1:2, labels = TRUE, shape = "point", repel = TRUE) +
+  ggtitle("Modelo 2 (conjunto) — Weights PC1-PC2")
+```
+
+```{r, fig.width=11, fig.height=8}
+plsPlot(modelo2_pls2, type = "weights", comp = 3:4, shape = "point", labels = TRUE, repel = TRUE) +
+  ggtitle("Modelo 2 (conjunto) — Weights PC3-PC4")
+```
+
+### 2.4.5 Significación de las relaciones bacteria-metabolito
+
+```{r, fig.show='hide'}
+set.seed(123)
+
+jack_model2 <- plsVarSel(modelo2_pls2, type = "Jack", rep = 100, threshold = 0.05)
+perm_model2 <- plsVarSel(modelo2_pls2, type = "Perm", rep = 1000, threshold = 0.05)
+vip_model2  <- plsVarSel(modelo2_pls2, type = "VIP")
+```
+
+```{r}
+cat("Metabolitos con alguna bacteria significativa (Jack):", sum(sapply(jack_model2, nrow) > 0), "\n")
+cat("Metabolitos con alguna bacteria significativa (Perm):", sum(sapply(perm_model2, nrow) > 0), "\n")
+cat("Relaciones totales (Jack):", sum(sapply(jack_model2, nrow)), "\n")
+cat("Relaciones totales (Perm):", sum(sapply(perm_model2, nrow)), "\n")
+cat("Bacterias con VIP > 1:", nrow(vip_model2), "\n")
+```
+
+```{r}
+bacterias_perm_model2 <- perm_model2 %>%
+  discard(~ nrow(.x) == 0) %>%
+  map(rownames) %>%
+  unlist() %>%
+  unique()
+
+intersect(rownames(vip_model2), bacterias_perm_model2)
+```
+
+```{r}
+perm_no_vacios_model2 <- perm_model2[sapply(perm_model2, nrow) > 0]
+
+tabla_relaciones_model2 <- perm_no_vacios_model2 %>%
+  imap_dfr(~ tibble(
+    metabolito = .y,
+    bacteria   = rownames(.x),
+    p_perm     = .x$pValPerm
+  )) %>%
+  mutate(en_VIP = bacteria %in% rownames(vip_model2)) %>%
+  mutate(coeficiente = modelo2_pls2$coefficients[cbind(bacteria, metabolito)]) %>%
+  arrange(metabolito, p_perm)
+
+tabla_relaciones_model2
+```
+
+```{r}
+write_csv(tabla_relaciones_model2, file.path(processed_dir, "relaciones_bacteria_metabolito_model2_perm.csv"))
+```
+
+## 2.5 PLS2 separado por subgrupo (High vs. Standard vs. Negative)
+
+Se incluyen los 3 niveles de riesgo genético, tratados de forma simétrica — igual que en el LMM, donde `Standard` cuenta con el mismo peso que `High` en el criterio `EC_specific` (no hay motivo para tratarlo de forma distinta aquí).
+
+**Nota metodológica**: `High` (19 muestras) y `Negative` (14 muestras) tienen menos muestras que las 20 variables X — un escenario de alta dimensionalidad (p ≥ n). `Standard`, al tener bastantes más sujetos (19 sujetos frente a 7 y 5), previsiblemente no tiene este problema. Confirmado con la directora que el objetivo de este análisis es **descriptivo** (covariación observada en esta muestra concreta), no predictivo, por lo que se procede igualmente con los tres subgrupos; el R²Y/Q² de `High`/`Negative` no deben interpretarse como capacidad predictiva dado el tamaño muestral.
+
+### 2.5.1 División de las muestras por subgrupo
+
+```{r}
+species_high_model2      <- species_aligned_model2     %>% filter(Genetic_Risk_Group == "High")
+species_standard_model2  <- species_aligned_model2     %>% filter(Genetic_Risk_Group == "Standard")
+species_negative_model2  <- species_aligned_model2     %>% filter(Genetic_Risk_Group == "Negative")
+
+metabolites_high_model2     <- metabolites_aligned_model2 %>% filter(Genetic_Risk_Group == "High")
+metabolites_standard_model2 <- metabolites_aligned_model2 %>% filter(Genetic_Risk_Group == "Standard")
+metabolites_negative_model2 <- metabolites_aligned_model2 %>% filter(Genetic_Risk_Group == "Negative")
+
+cat("Muestras High:     ", nrow(species_high_model2), "\n")
+cat("Muestras Standard: ", nrow(species_standard_model2), "\n")
+cat("Muestras Negative: ", nrow(species_negative_model2), "\n")
+```
+
+```{r}
+identical(species_high_model2$sample_key, metabolites_high_model2$sample_key)
+identical(species_standard_model2$sample_key, metabolites_standard_model2$sample_key)
+identical(species_negative_model2$sample_key, metabolites_negative_model2$sample_key)
+```
+
+```{r}
+X_high_model2 <- species_high_model2 %>% select(all_of(variables_species_model2)) %>% as.data.frame()
+Y_high_model2 <- metabolites_high_model2 %>% select(all_of(variables_metabolites_model2)) %>% as.data.frame()
+rownames(X_high_model2) <- species_high_model2$sample_key
+rownames(Y_high_model2) <- metabolites_high_model2$sample_key
+
+X_standard_model2 <- species_standard_model2 %>% select(all_of(variables_species_model2)) %>% as.data.frame()
+Y_standard_model2 <- metabolites_standard_model2 %>% select(all_of(variables_metabolites_model2)) %>% as.data.frame()
+rownames(X_standard_model2) <- species_standard_model2$sample_key
+rownames(Y_standard_model2) <- metabolites_standard_model2$sample_key
+
+X_negative_model2 <- species_negative_model2 %>% select(all_of(variables_species_model2)) %>% as.data.frame()
+Y_negative_model2 <- metabolites_negative_model2 %>% select(all_of(variables_metabolites_model2)) %>% as.data.frame()
+rownames(X_negative_model2) <- species_negative_model2$sample_key
+rownames(Y_negative_model2) <- metabolites_negative_model2$sample_key
+
+cat("High:     X", dim(X_high_model2), " Y", dim(Y_high_model2), "\n")
+cat("Standard: X", dim(X_standard_model2), " Y", dim(Y_standard_model2), "\n")
+cat("Negative: X", dim(X_negative_model2), " Y", dim(Y_negative_model2), "\n")
+```
+
+### 2.5.2 Selección del número de componentes (por subgrupo)
+
+Con `High`/`Negative` en p ≥ n, se usa `cvFolds = 3` para ambos. Para `Standard`, al tener previsiblemente más muestras que variables, se usa `cvFolds = 5` (igual que en el modelo conjunto) — comprobar con el `dim()` anterior si esto es razonable.
+
+#### Ajuste exploratorio (ncomp = 10)
+
+```{r}
+set.seed(123)
+modelo2_high <- pls(
+  x = X_high_model2, y = Y_high_model2, ncomp = 10,
+  cvFolds = 3, rep = 10, perm = 100,
+  scaling = "standard", scalingY = "standard",
+  algo = "nipals", train = 1, parallel = FALSE
+)
+
+set.seed(123)
+modelo2_standard <- pls(
+  x = X_standard_model2, y = Y_standard_model2, ncomp = 10,
+  cvFolds = 5, rep = 10, perm = 100,
+  scaling = "standard", scalingY = "standard",
+  algo = "nipals", train = 1, parallel = FALSE
+)
+
+set.seed(123)
+modelo2_negative <- pls(
+  x = X_negative_model2, y = Y_negative_model2, ncomp = 10,
+  cvFolds = 3, rep = 10, perm = 100,
+  scaling = "standard", scalingY = "standard",
+  algo = "nipals", train = 1, parallel = FALSE
+)
+```
+
+#### High
+
+```{r}
+modelo2_high$summary
+```
+
+```{r}
+plsPlot(modelo2_high, type = "R2vsQ2") +
+  ggtitle("Modelo 2 (High) — R² vs Q²")
+```
+
+#### Standard
+
+```{r}
+modelo2_standard$summary
+```
+
+```{r}
+plsPlot(modelo2_standard, type = "R2vsQ2") +
+  ggtitle("Modelo 2 (Standard) — R² vs Q²")
+```
+
+#### Negative
+
+```{r}
+modelo2_negative$summary
+```
+
+```{r}
+plsPlot(modelo2_negative, type = "R2vsQ2") +
+  ggtitle("Modelo 2 (Negative) — R² vs Q²")
+```
+
+#### Reajuste con el nº de componentes definitivo
+
+```{r}
+ncomp_model2_high     <- 2
+ncomp_model2_standard <- 4
+ncomp_model2_negative <- 2
+
+set.seed(123)
+modelo2_high <- pls(
+  x = X_high_model2, y = Y_high_model2, ncomp = ncomp_model2_high,
+  cvFolds = 3, rep = 10, perm = 100,
+  scaling = "standard", scalingY = "standard",
+  algo = "nipals", train = 1, parallel = FALSE
+)
+
+set.seed(123)
+modelo2_standard <- pls(
+  x = X_standard_model2, y = Y_standard_model2, ncomp = ncomp_model2_standard,
+  cvFolds = 5, rep = 10, perm = 100,
+  scaling = "standard", scalingY = "standard",
+  algo = "nipals", train = 1, parallel = FALSE
+)
+
+set.seed(123)
+modelo2_negative <- pls(
+  x = X_negative_model2, y = Y_negative_model2, ncomp = ncomp_model2_negative,
+  cvFolds = 3, rep = 10, perm = 100,
+  scaling = "standard", scalingY = "standard",
+  algo = "nipals", train = 1, parallel = FALSE
+)
+```
+
+**High** (`ncomp = 2`)
+
+```{r}
+modelo2_high$summary
+```
+
+**Standard** (`ncomp = 4`)
+
+```{r}
+modelo2_standard$summary
+```
+
+**Negative** (`ncomp = 2`)
+
+```{r}
+modelo2_negative$summary
+```
+
+### 2.5.3 Gráficos exploratorios por subgrupo
+
+#### High
+
+```{r}
+covar_time_high_model2 <- factor(species_high_model2$time_point,
+                                  levels = c("Enrollment", "3_months", "4_6_months"))
+
+p1_high <- plsPlot(modelo2_high, type = "scoresX", comp = 1:2,
+                    colBy = data.frame(time_point = covar_time_high_model2),
+                    labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 2 (High) — Scores X PC1-PC2 por tiempo")
+
+p2_high <- plsPlot(modelo2_high, type = "scoresY", comp = 1:2,
+                    colBy = data.frame(time_point = covar_time_high_model2),
+                    labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 2 (High) — Scores Y PC1-PC2 por tiempo")
+
+grid.arrange(p1_high, p2_high, ncol = 2)
+```
+
+```{r}
+p_loadX_high <- plsPlot(modelo2_high, type = "loadingsX", comp = 1:2, shape = "point", labels = FALSE, repel = TRUE) +
+  ggtitle("Modelo 2 (High) — Loadings X PC1-PC2")
+p_loadY_high <- plsPlot(modelo2_high, type = "loadingsY", comp = 1:2, shape = "point", labels = FALSE, repel = TRUE) +
+  ggtitle("Modelo 2 (High) — Loadings Y PC1-PC2")
+grid.arrange(p_loadX_high, p_loadY_high, ncol = 2)
+```
+
+```{r, fig.width=11, fig.height=8}
+plsPlot(modelo2_high, type = "loadingsX", comp = 1:2, shape = "point", labels = TRUE, repel = TRUE) +
+  ggtitle("Modelo 2 (High) — Loadings X PC1-PC2")
+```
+
+```{r, fig.width=11, fig.height=8}
+plsPlot(modelo2_high, type = "loadingsY", comp = 1:2, shape = "point", labels = TRUE, repel = TRUE) +
+  ggtitle("Modelo 2 (High) — Loadings Y PC1-PC2")
+```
+
+```{r}
+plsPlot(modelo2_high, type = "weights", comp = 1:2, shape = "point",labels = FALSE, repel = TRUE) +
+  ggtitle("Modelo 2 (High) — Weights PC1-PC2")
+```
+
+```{r, fig.width=11, fig.height=8}
+plsPlot(modelo2_high, type = "weights", comp = 1:2, shape = "point",labels = TRUE, repel = TRUE) +
+  ggtitle("Modelo 2 (High) — Weights PC1-PC2")
+```
+
+#### Standard
+
+```{r}
+covar_time_standard_model2 <- factor(species_standard_model2$time_point,
+                                      levels = c("Enrollment", "3_months", "4_6_months"))
+
+p1_standard <- plsPlot(modelo2_standard, type = "scoresX", comp = 1:2,
+                        colBy = data.frame(time_point = covar_time_standard_model2),
+                        labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 2 (Standard) — Scores X PC1-PC2 por tiempo")
+
+p2_standard <- plsPlot(modelo2_standard, type = "scoresY", comp = 1:2,
+                        colBy = data.frame(time_point = covar_time_standard_model2),
+                        labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 2 (Standard) — Scores Y PC1-PC2 por tiempo")
+
+grid.arrange(p1_standard, p2_standard, ncol = 2)
+```
+
+```{r}
+p_loadX_standard <- plsPlot(modelo2_standard, type = "loadingsX", comp = 1:2, shape = "point", labels = FALSE, repel = TRUE) +
+  ggtitle("Modelo 2 (Standard) — Loadings X PC1-PC2")
+p_loadY_standard <- plsPlot(modelo2_standard, type = "loadingsY", comp = 1:2, shape = "point", labels = FALSE, repel = TRUE) +
+  ggtitle("Modelo 2 (Standard) — Loadings Y PC1-PC2")
+grid.arrange(p_loadX_standard, p_loadY_standard, ncol = 2)
+```
+
+```{r, fig.width=11, fig.height=8}
+plsPlot(modelo2_standard, type = "loadingsX", comp = 1:2, shape = "point", labels = TRUE, repel = TRUE) +
+  ggtitle("Modelo 2 (Standard) — Loadings X PC1-PC2")
+```
+
+```{r, fig.width=11, fig.height=8}
+plsPlot(modelo2_standard, type = "loadingsY", comp = 1:2, shape = "point", labels = TRUE, repel = TRUE) +
+  ggtitle("Modelo 2 (Standard) — Loadings Y PC1-PC2")
+```
+
+```{r}
+plsPlot(modelo2_standard, type = "weights", comp = 1:2, labels = FALSE, shape = "point", repel = TRUE) +
+  ggtitle("Modelo 2 (Standard) — Weights PC1-PC2")
+```
+
+```{r, fig.width=11, fig.height=8}
+plsPlot(modelo2_standard, type = "weights", comp = 1:2, labels = TRUE, shape = "point", repel = TRUE) +
+  ggtitle("Modelo 2 (Standard) — Weights PC1-PC2")
+```
+
+#### Negative
+
+```{r}
+covar_time_negative_model2 <- factor(species_negative_model2$time_point,
+                                      levels = c("Enrollment", "3_months", "4_6_months"))
+
+p1_negative <- plsPlot(modelo2_negative, type = "scoresX", comp = 1:2,
+                        colBy = data.frame(time_point = covar_time_negative_model2),
+                        labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 2 (Negative) — Scores X PC1-PC2 por tiempo")
+
+p2_negative <- plsPlot(modelo2_negative, type = "scoresY", comp = 1:2,
+                        colBy = data.frame(time_point = covar_time_negative_model2),
+                        labels = FALSE, ellipses = FALSE) +
+  ggtitle("Modelo 2 (Negative) — Scores Y PC1-PC2 por tiempo")
+
+grid.arrange(p1_negative, p2_negative, ncol = 2)
+```
+
+```{r}
+p_loadX_negative <- plsPlot(modelo2_negative, type = "loadingsX", comp = 1:2, shape = "point", labels = FALSE, repel = TRUE) +
+  ggtitle("Modelo 2 (Negative) — Loadings X PC1-PC2")
+p_loadY_negative <- plsPlot(modelo2_negative, type = "loadingsY", comp = 1:2, shape = "point", labels = FALSE, repel = TRUE) +
+  ggtitle("Modelo 2 (Negative) — Loadings Y PC1-PC2")
+grid.arrange(p_loadX_negative, p_loadY_negative, ncol = 2)
+```
+
+```{r, fig.width=11, fig.height=8}
+plsPlot(modelo2_negative, type = "loadingsX", comp = 1:2, shape = "point", labels = TRUE, repel = TRUE) +
+  ggtitle("Modelo 2 (Negative) — Loadings X PC1-PC2")
+```
+
+```{r, fig.width=11, fig.height=8}
+plsPlot(modelo2_negative, type = "loadingsY", comp = 1:2, shape = "point", labels = TRUE, repel = TRUE) +
+  ggtitle("Modelo 2 (Negative) — Loadings Y PC1-PC2")
+```
+
+```{r}
+plsPlot(modelo2_negative, type = "weights", comp = 1:2, labels = FALSE, shape = "point", repel = TRUE) +
+  ggtitle("Modelo 2 (Negative) — Weights PC1-PC2")
+```
+
+```{r, fig.width=11, fig.height=8}
+plsPlot(modelo2_negative, type = "weights", comp = 1:2, labels = TRUE, shape = "point", repel = TRUE) +
+  ggtitle("Modelo 2 (Negative) — Weights PC1-PC2")
+```
+
+### 2.5.4 Significación de relaciones bacteria-metabolito, por subgrupo
+
+#### Ajuste (Jackknife / Permutación / VIP)
+
+```{r, fig.show='hide'}
+set.seed(123)
+jack_high <- plsVarSel(modelo2_high, type = "Jack", rep = 100, threshold = 0.05)
+perm_high <- plsVarSel(modelo2_high, type = "Perm", rep = 1000, threshold = 0.05)
+vip_high  <- plsVarSel(modelo2_high, type = "VIP")
+
+set.seed(123)
+jack_standard <- plsVarSel(modelo2_standard, type = "Jack", rep = 100, threshold = 0.05)
+perm_standard <- plsVarSel(modelo2_standard, type = "Perm", rep = 1000, threshold = 0.05)
+vip_standard  <- plsVarSel(modelo2_standard, type = "VIP")
+
+set.seed(123)
+jack_negative <- plsVarSel(modelo2_negative, type = "Jack", rep = 100, threshold = 0.05)
+perm_negative <- plsVarSel(modelo2_negative, type = "Perm", rep = 1000, threshold = 0.05)
+vip_negative  <- plsVarSel(modelo2_negative, type = "VIP")
+```
+
+#### Resumen de conteos por subgrupo
+
+```{r}
+cat("High     - Jack:", sum(sapply(jack_high, nrow) > 0), " Perm:", sum(sapply(perm_high, nrow) > 0), " VIP:", nrow(vip_high), "\n")
+cat("Standard - Jack:", sum(sapply(jack_standard, nrow) > 0), " Perm:", sum(sapply(perm_standard, nrow) > 0), " VIP:", nrow(vip_standard), "\n")
+cat("Negative - Jack:", sum(sapply(jack_negative, nrow) > 0), " Perm:", sum(sapply(perm_negative, nrow) > 0), " VIP:", nrow(vip_negative), "\n")
+```
+
+#### Tabla de relaciones — High
+
+```{r}
+tabla_high_model2 <- perm_high[sapply(perm_high, nrow) > 0] %>%
+  imap_dfr(~ tibble(
+    metabolito = .y,
+    bacteria   = rownames(.x),
+    p_perm     = .x$pValPerm
+  )) %>%
+  mutate(en_VIP = bacteria %in% rownames(vip_high)) %>%
+  mutate(coeficiente = modelo2_high$coefficients[cbind(bacteria, metabolito)]) %>%
+  arrange(metabolito, p_perm)
+
+tabla_standard_model2 <- perm_standard[sapply(perm_standard, nrow) > 0] %>%
+  imap_dfr(~ tibble(
+    metabolito = .y,
+    bacteria   = rownames(.x),
+    p_perm     = .x$pValPerm
+  )) %>%
+  mutate(en_VIP = bacteria %in% rownames(vip_standard)) %>%
+  mutate(coeficiente = modelo2_standard$coefficients[cbind(bacteria, metabolito)]) %>%
+  arrange(metabolito, p_perm)
+
+tabla_negative_model2 <- perm_negative[sapply(perm_negative, nrow) > 0] %>%
+  imap_dfr(~ tibble(
+    metabolito = .y,
+    bacteria   = rownames(.x),
+    p_perm     = .x$pValPerm
+  )) %>%
+  mutate(en_VIP = bacteria %in% rownames(vip_negative)) %>%
+  mutate(coeficiente = modelo2_negative$coefficients[cbind(bacteria, metabolito)]) %>%
+  arrange(metabolito, p_perm)
+
+tabla_high_model2
+```
+
+#### Tabla de relaciones — Standard
+
+```{r}
+tabla_standard_model2
+```
+
+#### Tabla de relaciones — Negative
+
+```{r}
+tabla_negative_model2
+```
+
+```{r}
+write_csv(tabla_high_model2,     file.path(processed_dir, "relaciones_bacteria_metabolito_model2_high.csv"))
+write_csv(tabla_standard_model2, file.path(processed_dir, "relaciones_bacteria_metabolito_model2_standard.csv"))
+write_csv(tabla_negative_model2, file.path(processed_dir, "relaciones_bacteria_metabolito_model2_negative.csv"))
+```
+
+### 2.5.5 Comparación entre los tres subgrupos
+
+```{r}
+pares_high_model2     <- paste(tabla_high_model2$bacteria, tabla_high_model2$metabolito, sep = "__")
+pares_standard_model2 <- paste(tabla_standard_model2$bacteria, tabla_standard_model2$metabolito, sep = "__")
+pares_negative_model2 <- paste(tabla_negative_model2$bacteria, tabla_negative_model2$metabolito, sep = "__")
+
+cat("--- High vs. Negative ---\n")
+cat("Relaciones solo en High:     ", length(setdiff(pares_high_model2, pares_negative_model2)), "\n")
+cat("Relaciones solo en Negative: ", length(setdiff(pares_negative_model2, pares_high_model2)), "\n")
+cat("Relaciones en ambos:         ", length(intersect(pares_high_model2, pares_negative_model2)), "\n\n")
+
+cat("--- High vs. Standard ---\n")
+cat("Relaciones solo en High:     ", length(setdiff(pares_high_model2, pares_standard_model2)), "\n")
+cat("Relaciones solo en Standard: ", length(setdiff(pares_standard_model2, pares_high_model2)), "\n")
+cat("Relaciones en ambos:         ", length(intersect(pares_high_model2, pares_standard_model2)), "\n\n")
+
+cat("--- Standard vs. Negative ---\n")
+cat("Relaciones solo en Standard: ", length(setdiff(pares_standard_model2, pares_negative_model2)), "\n")
+cat("Relaciones solo en Negative: ", length(setdiff(pares_negative_model2, pares_standard_model2)), "\n")
+cat("Relaciones en ambos:         ", length(intersect(pares_standard_model2, pares_negative_model2)), "\n\n")
+
+cat("Bacterias en High:     ", paste(sort(unique(tabla_high_model2$bacteria)), collapse = ", "), "\n")
+cat("Bacterias en Standard: ", paste(sort(unique(tabla_standard_model2$bacteria)), collapse = ", "), "\n")
+cat("Bacterias en Negative: ", paste(sort(unique(tabla_negative_model2$bacteria)), collapse = ", "), "\n")
+```
+
+```{r}
+Reduce(intersect, list(pares_high_model2, pares_standard_model2, pares_negative_model2))
+```
+
+```{r}
+intersect(pares_high_model2, pares_negative_model2)
+intersect(pares_high_model2, pares_standard_model2)
+intersect(pares_standard_model2, pares_negative_model2)
+```
+
+## 2.6 Grafos — Modelo 2
+
+```{r, fig.width=11, fig.height=9}
+plot_bipartite_graph(tabla_relaciones_model2, "Relaciones bacteria-metabolito — Modelo 2 (conjunto)")
+```
+
+### 2.6.0 Alternativa: división en bloques (grafo conjunto denso)
+
+```{r, fig.width=11, fig.height=9}
+walk(plot_bipartite_graph_split(tabla_relaciones_model2, "Relaciones — Modelo 2 (conjunto)", block_size = 20), print)
+```
+
+```{r, fig.width=7, fig.height=6}
+walk(plot_star_by_bacteria(tabla_relaciones_model2), print)
+```
+
+```{r, fig.width=11, fig.height=9}
+plot_bipartite_graph(tabla_high_model2, "Modelo 2 — High")
+```
+
+```{r, fig.width=7, fig.height=6}
+walk(plot_star_by_bacteria(tabla_high_model2), print)
+```
+
+```{r, fig.width=11, fig.height=9}
+plot_bipartite_graph(tabla_standard_model2, "Modelo 2 — Standard")
+```
+
+```{r, fig.width=7, fig.height=6}
+walk(plot_star_by_bacteria(tabla_standard_model2), print)
+```
+
+```{r, fig.width=11, fig.height=9}
+plot_bipartite_graph(tabla_negative_model2, "Modelo 2 — Negative")
+```
+
+```{r, fig.width=7, fig.height=6}
+walk(plot_star_by_bacteria(tabla_negative_model2), print)
+```
+
+## 2.7 Heatmaps — Modelo 2
+
+```{r, fig.width=11, fig.height=6}
+plot_heatmap_relaciones(tabla_relaciones_model2, "Relaciones bacteria-metabolito — Modelo 2 (conjunto)")
+```
+
+```{r, fig.width=11, fig.height=6}
+plot_heatmap_relaciones(tabla_high_model2, "Modelo 2 — High")
+```
+
+```{r, fig.width=11, fig.height=6}
+plot_heatmap_relaciones(tabla_standard_model2, "Modelo 2 — Standard")
+```
+
+```{r, fig.width=11, fig.height=6}
+plot_heatmap_relaciones(tabla_negative_model2, "Modelo 2 — Negative")
+```
+
+

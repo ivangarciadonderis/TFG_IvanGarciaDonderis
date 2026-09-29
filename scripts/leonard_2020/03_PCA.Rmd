@@ -1,0 +1,1647 @@
+---
+title: "Análisis de Componentes Principales (PCA) — Leonard et al. (2020)"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+date: "2026-06-29"
+---
+
+Este script realiza el análisis exploratorio de las tres matrices ómicas mediante PCA. 
+
+# Carga de librerías y datos
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(PLSandO)
+library(gridExtra)
+library(knitr)
+library(here)
+library(ggplot2)
+
+processed_dir <- here("data", "processed", "leonard_2020")
+
+species_clr_data     <- readRDS(file.path(processed_dir, "species_clr_data.rds"))
+pathways_clr_data    <- readRDS(file.path(processed_dir, "pathways_clr_data.rds"))
+metabolites_log_data <- readRDS(file.path(processed_dir, "metabolites_log_data.rds"))
+
+dim(species_clr_data)
+dim(pathways_clr_data)
+dim(metabolites_log_data)
+```
+
+```{r}
+top_loadings_pc <- function(modelo_pca, componente, n = 10) {
+  
+  tibble(
+    PC = paste0("PC", componente),
+    variable = rownames(modelo_pca$loadings),
+    loading = modelo_pca$loadings[, componente]
+  ) %>%
+    mutate(
+      abs_loading = abs(loading)
+    ) %>%
+    arrange(desc(abs_loading)) %>%
+    slice_head(n = n)
+}
+```
+
+
+# Separación de metadatos y matrices numéricas
+
+```{r}
+metadata_cols <- c(
+  "PaperID", "time_point", "country", "Delivery_Mode", "Gender",
+  "Genetic_Risk", "Feeding_Type",
+  "Maternal_antibiotics_during_Delivery",
+  "Infant_antibiotics_at_Birth",
+  "Infant_antibiotics_before_6mo",
+  "Antibiotics_Exposure_at_Birth",
+  "Exposure_to_Environmental_Factors",
+  "Genetic_Risk_Group",
+  "Enrollment_Sample", "Three_Month_Sample", "Four_Six_Month_Sample"
+)
+
+species_meta <- species_clr_data %>% select(any_of(metadata_cols))
+species_X    <- species_clr_data %>%
+  select(-any_of(metadata_cols)) %>%
+  mutate(across(everything(), as.numeric)) %>%
+  as.data.frame()
+
+rownames(species_X) <- paste(species_meta$PaperID, species_meta$time_point, sep = "_")
+
+pathways_meta <- pathways_clr_data %>% select(any_of(metadata_cols))
+pathways_X    <- pathways_clr_data %>%
+  select(-any_of(metadata_cols)) %>%
+  mutate(across(everything(), as.numeric)) %>%
+  as.data.frame()
+
+rownames(pathways_X) <- paste(pathways_meta$PaperID, pathways_meta$time_point, sep = "_")
+
+metabolites_meta <- metabolites_log_data %>% select(any_of(metadata_cols))
+metabolites_X    <- metabolites_log_data %>%
+  select(-any_of(metadata_cols)) %>%
+  mutate(across(everything(), as.numeric)) %>%
+  as.data.frame()
+
+rownames(metabolites_X) <- paste(metabolites_meta$PaperID, metabolites_meta$time_point, sep = "_")
+
+species_time <- factor(species_meta$time_point, levels = c("Enrollment", "3_months", "4_6_months"))
+pathways_time <- factor(pathways_meta$time_point, levels = c("Enrollment", "3_months", "4_6_months"))
+metabolites_time <- factor(metabolites_meta$time_point, levels = c("Enrollment", "3_months", "4_6_months"))
+```
+
+Función auxiliar reutilizada en la detección de anómalos de las tres ómicas (escalado centrado y estándar): para cada muestra anómala, devuelve las `n` variables que más contribuyen a su anomalía.
+
+```{r}
+get_top_contrib_list <- function(contrib_matrix, n = 10) {
+  lapply(rownames(contrib_matrix), function(sample_name) {
+    row <- contrib_matrix[sample_name, ]
+    top <- row[order(abs(row), decreasing = TRUE)][1:n]
+    tibble(
+      sample_id    = sample_name,
+      pathway      = names(top),
+      contribution = as.numeric(top)
+    )
+  })
+}
+```
+
+---
+
+# PCA — Species
+
+## Escalado centrado (`scaling = "center"`)
+
+Se replica el mismo flujo que en el escalado estándar (elegido para el análisis principal), con `scaling = "center"`, para poder comparar ambos y justificar en la memoria la elección final del escalado.
+
+### Cálculo y scree plot
+
+```{r}
+species_pca_ctr <- pca(species_X, ncomp = NULL, algo = "nipals", scaling = "center")
+pcaPlot(species_pca_ctr, type = "scree") +
+  ggtitle("Especies — Varianza explicada por componente (centrado)")
+```
+
+### Score plots — Exposición ambiental
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(species_pca_ctr, type = "scores", comp = 1:2,
+              colBy = data.frame(Exposicion = species_meta$Exposure_to_Environmental_Factors),
+              labels = FALSE, ellipses = FALSE)
+p2 <- pcaPlot(species_pca_ctr, type = "scores", comp = 3:4,
+              colBy = data.frame(Exposicion = species_meta$Exposure_to_Environmental_Factors),
+              labels = FALSE, ellipses = FALSE)
+p3 <- pcaPlot(species_pca_ctr, type = "scores", comp = 5:6,
+              colBy = data.frame(Exposicion = species_meta$Exposure_to_Environmental_Factors),
+              labels = FALSE, ellipses = FALSE)
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+### Score plots — Riesgo genético
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(species_pca_ctr, type = "scores", comp = 1:2,
+              colBy = data.frame(Riesgo_Genetico = species_meta$Genetic_Risk_Group),
+              labels = FALSE, ellipses = FALSE)
+p2 <- pcaPlot(species_pca_ctr, type = "scores", comp = 3:4,
+              colBy = data.frame(Riesgo_Genetico = species_meta$Genetic_Risk_Group),
+              labels = FALSE, ellipses = FALSE)
+p3 <- pcaPlot(species_pca_ctr, type = "scores", comp = 5:6,
+              colBy = data.frame(Riesgo_Genetico = species_meta$Genetic_Risk_Group),
+              labels = FALSE, ellipses = FALSE)
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+### Score plots — Tiempo
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(species_pca_ctr, type = "scores", comp = 1:2,
+              colBy = data.frame(Tiempo = species_time),
+              labels = FALSE, ellipses = FALSE)
+p2 <- pcaPlot(species_pca_ctr, type = "scores", comp = 3:4,
+              colBy = data.frame(Tiempo = species_time),
+              labels = FALSE, ellipses = FALSE)
+p3 <- pcaPlot(species_pca_ctr, type = "scores", comp = 5:6,
+              colBy = data.frame(Tiempo = species_time),
+              labels = FALSE, ellipses = FALSE)
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+### Score plots — País
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(species_pca_ctr, type = "scores", comp = 1:2,
+              colBy = data.frame(Pais = species_meta$country),
+              labels = FALSE, ellipses = FALSE)
+p2 <- pcaPlot(species_pca_ctr, type = "scores", comp = 3:4,
+              colBy = data.frame(Pais = species_meta$country),
+              labels = FALSE, ellipses = FALSE)
+p3 <- pcaPlot(species_pca_ctr, type = "scores", comp = 5:6,
+              colBy = data.frame(Pais = species_meta$country),
+              labels = FALSE, ellipses = FALSE)
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+### Score plots — Modo de parto
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(species_pca_ctr, type = "scores", comp = 1:2,
+              colBy = data.frame(Parto = species_meta$Delivery_Mode),
+              labels = FALSE, ellipses = FALSE)
+p2 <- pcaPlot(species_pca_ctr, type = "scores", comp = 3:4,
+              colBy = data.frame(Parto = species_meta$Delivery_Mode),
+              labels = FALSE, ellipses = FALSE)
+p3 <- pcaPlot(species_pca_ctr, type = "scores", comp = 5:6,
+              colBy = data.frame(Parto = species_meta$Delivery_Mode),
+              labels = FALSE, ellipses = FALSE)
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+### Score plots — Tipo de alimentación
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(species_pca_ctr, type = "scores", comp = 1:2,
+              colBy = data.frame(Alimentacion = species_meta$Feeding_Type),
+              labels = FALSE, ellipses = FALSE)
+p2 <- pcaPlot(species_pca_ctr, type = "scores", comp = 3:4,
+              colBy = data.frame(Alimentacion = species_meta$Feeding_Type),
+              labels = FALSE, ellipses = FALSE)
+p3 <- pcaPlot(species_pca_ctr, type = "scores", comp = 5:6,
+              colBy = data.frame(Alimentacion = species_meta$Feeding_Type),
+              labels = FALSE, ellipses = FALSE)
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+### Score plots — Sexo
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(species_pca_ctr, type = "scores", comp = 1:2,
+              colBy = data.frame(Sexo = species_meta$Gender),
+              labels = FALSE, ellipses = FALSE)
+p2 <- pcaPlot(species_pca_ctr, type = "scores", comp = 3:4,
+              colBy = data.frame(Sexo = species_meta$Gender),
+              labels = FALSE, ellipses = FALSE)
+p3 <- pcaPlot(species_pca_ctr, type = "scores", comp = 5:6,
+              colBy = data.frame(Sexo = species_meta$Gender),
+              labels = FALSE, ellipses = FALSE)
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+### Loadings — Correlation plots
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+l1 <- pcaPlot(species_pca_ctr, type = "corr", comp = 1:2,
+              colBy = "contrib", shape = "point", labels = FALSE, repel = TRUE, col = "hot")
+l2 <- pcaPlot(species_pca_ctr, type = "corr", comp = 3:4,
+              colBy = "contrib", shape = "point", labels = FALSE, repel = TRUE, col = "hot")
+l3 <- pcaPlot(species_pca_ctr, type = "corr", comp = 5:6,
+              colBy = "contrib", shape = "point", labels = FALSE, repel = TRUE, col = "hot")
+grid.arrange(l1, l2, l3, ncol = 3)
+```
+
+### Loadings — Top 10 especies
+
+**PC1 y PC2**
+
+```{r}
+tibble(
+  variable    = rownames(species_pca_ctr$loadings),
+  loading_PC1 = species_pca_ctr$loadings[, 1],
+  loading_PC2 = species_pca_ctr$loadings[, 2]
+) %>%
+  mutate(contribution_PC12 = loading_PC1^2 + loading_PC2^2) %>%
+  arrange(desc(contribution_PC12)) %>%
+  slice_head(n = 10) %>%
+  kable(caption = "Centrado — Top 10 especies PC1/PC2")
+```
+
+**PC3 y PC4**
+
+```{r}
+tibble(
+  variable    = rownames(species_pca_ctr$loadings),
+  loading_PC3 = species_pca_ctr$loadings[, 3],
+  loading_PC4 = species_pca_ctr$loadings[, 4]
+) %>%
+  mutate(contribution_PC34 = loading_PC3^2 + loading_PC4^2) %>%
+  arrange(desc(contribution_PC34)) %>%
+  slice_head(n = 10) %>%
+  kable(caption = "Centrado — Top 10 especies PC3/PC4")
+```
+
+**PC5 y PC6**
+
+```{r}
+tibble(
+  variable    = rownames(species_pca_ctr$loadings),
+  loading_PC5 = species_pca_ctr$loadings[, 5],
+  loading_PC6 = species_pca_ctr$loadings[, 6]
+) %>%
+  mutate(contribution_PC56 = loading_PC5^2 + loading_PC6^2) %>%
+  arrange(desc(contribution_PC56)) %>%
+  slice_head(n = 10) %>%
+  kable(caption = "Centrado — Top 10 especies PC5/PC6")
+```
+
+```{r}
+species_pca_ctr <- pca(
+  species_X,
+  ncomp   = 6,
+  algo    = "nipals",
+  scaling = "center"
+)
+```
+
+### Detección de muestras anómalas (centrado)
+
+```{r fig.width=10, fig.height=4}
+par(mfrow = c(1, 2))
+
+species_out_RSS_ctr <- pcaOutliers(species_pca_ctr, ncomp = species_pca_ctr$ncomp, method = "RSS", conf = 0.95)
+species_out_T2_ctr  <- pcaOutliers(species_pca_ctr, ncomp = species_pca_ctr$ncomp, method = "T2",  conf = 0.95)
+
+par(mfrow = c(1, 1))
+```
+
+```{r}
+species_moderate_ctr <- sort(
+  species_out_RSS_ctr$RSS[species_out_RSS_ctr$ModerateOutliers],
+  decreasing = TRUE
+)
+
+species_severe_ctr <- sort(
+  species_out_T2_ctr$T2[species_out_T2_ctr$SevereOutliers],
+  decreasing = TRUE
+)
+
+cat("Anómalos moderados (RSS) al 95 :\n"); print(species_moderate_ctr)
+cat("\nAnómalos severos (T²) al 95 :\n");   print(species_severe_ctr)
+```
+
+```{r}
+par(mfrow = c(1, 2))
+
+species_out_RSS_99_ctr <- pcaOutliers(species_pca_ctr, ncomp = species_pca_ctr$ncomp, method = "RSS", conf = 0.99)
+species_out_T2_99_ctr  <- pcaOutliers(species_pca_ctr, ncomp = species_pca_ctr$ncomp, method = "T2",  conf = 0.99)
+
+par(mfrow = c(1, 1))
+```
+
+```{r}
+species_moderate_99_ctr <- sort(species_out_RSS_99_ctr$RSS[species_out_RSS_99_ctr$ModerateOutliers],
+                    decreasing = TRUE)
+species_severe_99_ctr   <- sort(species_out_T2_99_ctr$T2[species_out_T2_99_ctr$SevereOutliers],
+                    decreasing = TRUE)
+
+cat("Moderados (RSS) al 99 :\n"); print(species_moderate_99_ctr)
+cat("Severos   (T²) al 99 :\n");  print(species_severe_99_ctr)
+```
+
+```{r}
+species_mod_contrib_99_ctr <- outlierContrib(species_pca_ctr, species_out_RSS_99_ctr)
+species_sev_contrib_99_ctr <- outlierContrib(species_pca_ctr, species_out_T2_99_ctr)
+```
+
+```{r}
+top10_moderate_ctr <- get_top_contrib_list(species_mod_contrib_99_ctr$contribRSS)
+top10_moderate_ctr
+```
+
+```{r}
+top10_severe_ctr <- get_top_contrib_list(species_sev_contrib_99_ctr$contribT2)
+top10_severe_ctr
+```
+
+## Escalado estándar (`scaling = "standard"`)
+
+### Cálculo y scree plot
+
+```{r}
+species_pca_std <- pca(species_X, ncomp = NULL, algo = "nipals", scaling = "standard")
+pcaPlot(species_pca_std, type = "scree") +
+  ggtitle("Especies — Varianza explicada por componente (escalado estándar)")
+```
+
+### Score plots — Exposición ambiental
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(species_pca_std, type = "scores", comp = 1:2,
+              colBy = data.frame(Exposicion = species_meta$Exposure_to_Environmental_Factors),
+              labels = FALSE, ellipses = FALSE)
+p2 <- pcaPlot(species_pca_std, type = "scores", comp = 3:4,
+              colBy = data.frame(Exposicion = species_meta$Exposure_to_Environmental_Factors),
+              labels = FALSE, ellipses = FALSE)
+p3 <- pcaPlot(species_pca_std, type = "scores", comp = 5:6,
+              colBy = data.frame(Exposicion = species_meta$Exposure_to_Environmental_Factors),
+              labels = FALSE, ellipses = FALSE)
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+### Score plots — Riesgo genético
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(species_pca_std, type = "scores", comp = 1:2,
+              colBy = data.frame(Riesgo_Genetico = species_meta$Genetic_Risk_Group),
+              labels = FALSE, ellipses = FALSE)
+p2 <- pcaPlot(species_pca_std, type = "scores", comp = 3:4,
+              colBy = data.frame(Riesgo_Genetico = species_meta$Genetic_Risk_Group),
+              labels = FALSE, ellipses = FALSE)
+p3 <- pcaPlot(species_pca_std, type = "scores", comp = 5:6,
+              colBy = data.frame(Riesgo_Genetico = species_meta$Genetic_Risk_Group),
+              labels = FALSE, ellipses = FALSE)
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+### Score plots — Tiempo
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(species_pca_std, type = "scores", comp = 1:2,
+              colBy = data.frame(Tiempo = species_time),
+              labels = FALSE, ellipses = FALSE)
+p2 <- pcaPlot(species_pca_std, type = "scores", comp = 3:4,
+              colBy = data.frame(Tiempo = species_time),
+              labels = FALSE, ellipses = FALSE)
+p3 <- pcaPlot(species_pca_std, type = "scores", comp = 5:6,
+              colBy = data.frame(Tiempo = species_time),
+              labels = FALSE, ellipses = FALSE)
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+### Score plots — País
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(species_pca_std, type = "scores", comp = 1:2,
+              colBy = data.frame(Pais = species_meta$country),
+              labels = FALSE, ellipses = FALSE)
+p2 <- pcaPlot(species_pca_std, type = "scores", comp = 3:4,
+              colBy = data.frame(Pais = species_meta$country),
+              labels = FALSE, ellipses = FALSE)
+p3 <- pcaPlot(species_pca_std, type = "scores", comp = 5:6,
+              colBy = data.frame(Pais = species_meta$country),
+              labels = FALSE, ellipses = FALSE)
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+### Score plots — Modo de parto
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(species_pca_std, type = "scores", comp = 1:2,
+              colBy = data.frame(Parto = species_meta$Delivery_Mode),
+              labels = FALSE, ellipses = FALSE)
+p2 <- pcaPlot(species_pca_std, type = "scores", comp = 3:4,
+              colBy = data.frame(Parto = species_meta$Delivery_Mode),
+              labels = FALSE, ellipses = FALSE)
+p3 <- pcaPlot(species_pca_std, type = "scores", comp = 5:6,
+              colBy = data.frame(Parto = species_meta$Delivery_Mode),
+              labels = FALSE, ellipses = FALSE)
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+### Score plots — Tipo de alimentación
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(species_pca_std, type = "scores", comp = 1:2,
+              colBy = data.frame(Alimentacion = species_meta$Feeding_Type),
+              labels = FALSE, ellipses = FALSE)
+p2 <- pcaPlot(species_pca_std, type = "scores", comp = 3:4,
+              colBy = data.frame(Alimentacion = species_meta$Feeding_Type),
+              labels = FALSE, ellipses = FALSE)
+p3 <- pcaPlot(species_pca_std, type = "scores", comp = 5:6,
+              colBy = data.frame(Alimentacion = species_meta$Feeding_Type),
+              labels = FALSE, ellipses = FALSE)
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+### Score plots — Sexo
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(species_pca_std, type = "scores", comp = 1:2,
+              colBy = data.frame(Sexo = species_meta$Gender),
+              labels = FALSE, ellipses = FALSE)
+p2 <- pcaPlot(species_pca_std, type = "scores", comp = 3:4,
+              colBy = data.frame(Sexo = species_meta$Gender),
+              labels = FALSE, ellipses = FALSE)
+p3 <- pcaPlot(species_pca_std, type = "scores", comp = 5:6,
+              colBy = data.frame(Sexo = species_meta$Gender),
+              labels = FALSE, ellipses = FALSE)
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+### Loadings — Correlation plots
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+l1 <- pcaPlot(species_pca_std, type = "corr", comp = 1:2,
+              colBy = "contrib", shape = "point", labels = FALSE, repel = TRUE, col = "hot")
+l2 <- pcaPlot(species_pca_std, type = "corr", comp = 3:4,
+              colBy = "contrib", shape = "point", labels = FALSE, repel = TRUE, col = "hot")
+l3 <- pcaPlot(species_pca_std, type = "corr", comp = 5:6,
+              colBy = "contrib", shape = "point", labels = FALSE, repel = TRUE, col = "hot")
+grid.arrange(l1, l2, l3, ncol = 3)
+```
+
+### Loadings — Top 10 especies
+
+**PC1 y PC2**
+
+```{r}
+tibble(
+  variable    = rownames(species_pca_std$loadings),
+  loading_PC1 = species_pca_std$loadings[, 1],
+  loading_PC2 = species_pca_std$loadings[, 2]
+) %>%
+  mutate(contribution_PC12 = loading_PC1^2 + loading_PC2^2) %>%
+  arrange(desc(contribution_PC12)) %>%
+  slice_head(n = 10) %>%
+  kable(caption = "Estándar — Top 10 especies PC1/PC2")
+```
+
+**PC3 y PC4**
+
+```{r}
+tibble(
+  variable    = rownames(species_pca_std$loadings),
+  loading_PC3 = species_pca_std$loadings[, 3],
+  loading_PC4 = species_pca_std$loadings[, 4]
+) %>%
+  mutate(contribution_PC34 = loading_PC3^2 + loading_PC4^2) %>%
+  arrange(desc(contribution_PC34)) %>%
+  slice_head(n = 10) %>%
+  kable(caption = "Estándar — Top 10 especies PC3/PC4")
+```
+
+**PC5 y PC6**
+
+```{r}
+tibble(
+  variable    = rownames(species_pca_std$loadings),
+  loading_PC5 = species_pca_std$loadings[, 5],
+  loading_PC6 = species_pca_std$loadings[, 6]
+) %>%
+  mutate(contribution_PC56 = loading_PC5^2 + loading_PC6^2) %>%
+  arrange(desc(contribution_PC56)) %>%
+  slice_head(n = 10) %>%
+  kable(caption = "Estándar — Top 10 especies PC5/PC6")
+```
+
+```{r}
+top_loadings_pc(species_pca_std, 1, n = 10)
+```
+
+
+```{r}
+top_loadings_pc(species_pca_std, 2, n = 10)
+```
+
+
+```{r}
+top_loadings_pc(species_pca_std, 3, n = 10)
+```
+
+
+```{r}
+top_loadings_pc(species_pca_std, 4, n = 10)
+```
+
+
+```{r}
+top_loadings_pc(species_pca_std, 5, n = 10)
+```
+
+
+```{r}
+top_loadings_pc(species_pca_std, 6, n = 10)
+```
+
+
+
+```{r}
+species_pca_std <- pca(
+  species_X,
+  ncomp   = 6,
+  algo    = "nipals",
+  scaling = "standard"
+)
+
+```
+
+## 4.4 Detección de muestras anómalas
+
+Se detectan muestras anómalas mediante dos criterios complementarios. El RSS y el T² de Hotelling. Las muestras detectadas se identifican pero **no se eliminan**.
+
+```{r fig.width=10, fig.height=4}
+par(mfrow = c(1, 2))
+
+species_out_RSS <- pcaOutliers(species_pca_std, ncomp = species_pca_std$ncomp,method = "RSS", conf = 0.95)
+species_out_T2  <- pcaOutliers(species_pca_std, ncomp = species_pca_std$ncomp,method = "T2",  conf = 0.95)
+
+par(mfrow = c(1, 1))
+```
+
+```{r}
+species_moderate <- sort(
+  species_out_RSS$RSS[species_out_RSS$ModerateOutliers],
+  decreasing = TRUE
+)
+
+species_severe <- sort(
+  species_out_T2$T2[species_out_T2$SevereOutliers],
+  decreasing = TRUE
+)
+
+cat("Anómalos moderados (RSS) al 95 :\n"); print(species_moderate)
+cat("\nAnómalos severos (T²) al 95 :\n");   print(species_severe)
+```
+
+```{r}
+par(mfrow = c(1, 2))
+
+species_out_RSS_99 <- pcaOutliers(species_pca_std, ncomp = species_pca_std$ncomp,method = "RSS", conf = 0.99)
+species_out_T2_99  <- pcaOutliers(species_pca_std, ncomp = species_pca_std$ncomp,method = "T2",  conf = 0.99)
+
+par(mfrow = c(1, 1))
+```
+
+
+```{r}
+moderate_99 <- sort(species_out_RSS_99$RSS[species_out_RSS_99$ModerateOutliers],
+                    decreasing = TRUE)
+severe_99   <- sort(species_out_T2_99$T2[species_out_T2_99$SevereOutliers],
+                    decreasing = TRUE)
+
+cat("Moderados (RSS) al 99 :\n"); print(moderate_99)
+cat("Severos   (T²) al 99 :\n");  print(severe_99)
+```
+```{r}
+species_mod_contrib_99 <- outlierContrib(species_pca_std, species_out_RSS_99)
+```
+
+
+```{r}
+species_sev_contrib_99 <- outlierContrib(species_pca_std, species_out_T2_99)
+```
+
+
+```{r}
+top10_moderate <- get_top_contrib_list(species_mod_contrib_99$contribRSS)
+
+
+top10_moderate
+```
+
+```{r}
+top10_severe <-get_top_contrib_list(species_sev_contrib_99$contribT2)
+
+top10_severe
+```
+
+---
+
+# PCA — Pathways
+
+## Escalado centrado (`scaling = "center"`)
+
+```{r}
+pathways_pca_ctr <- pca(pathways_X, ncomp = NULL, algo = "nipals", scaling = "center")
+pcaPlot(pathways_pca_ctr, type = "scree") +
+  ggtitle("Rutas — Varianza explicada por componente (centrado)")
+```
+
+### Score plots — Exposición ambiental
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(pathways_pca_ctr, type = "scores", comp = 1:2,
+              colBy = data.frame(Exposicion = pathways_meta$Exposure_to_Environmental_Factors),
+              labels = FALSE, ellipses = FALSE)
+p2 <- pcaPlot(pathways_pca_ctr, type = "scores", comp = 3:4,
+              colBy = data.frame(Exposicion = pathways_meta$Exposure_to_Environmental_Factors),
+              labels = FALSE, ellipses = FALSE)
+p3 <- pcaPlot(pathways_pca_ctr, type = "scores", comp = 5:6,
+              colBy = data.frame(Exposicion = pathways_meta$Exposure_to_Environmental_Factors),
+              labels = FALSE, ellipses = FALSE)
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+### Score plots — Riesgo genético
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(pathways_pca_ctr, type = "scores", comp = 1:2,
+              colBy = data.frame(Riesgo_Genetico = pathways_meta$Genetic_Risk_Group),
+              labels = FALSE, ellipses = FALSE)
+p2 <- pcaPlot(pathways_pca_ctr, type = "scores", comp = 3:4,
+              colBy = data.frame(Riesgo_Genetico = pathways_meta$Genetic_Risk_Group),
+              labels = FALSE, ellipses = FALSE)
+p3 <- pcaPlot(pathways_pca_ctr, type = "scores", comp = 5:6,
+              colBy = data.frame(Riesgo_Genetico = pathways_meta$Genetic_Risk_Group),
+              labels = FALSE, ellipses = FALSE)
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+### Score plots — Tiempo
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(pathways_pca_ctr, type = "scores", comp = 1:2,
+              colBy = data.frame(Tiempo = pathways_time),
+              labels = FALSE, ellipses = FALSE)
+p2 <- pcaPlot(pathways_pca_ctr, type = "scores", comp = 3:4,
+              colBy = data.frame(Tiempo = pathways_time),
+              labels = FALSE, ellipses = FALSE)
+p3 <- pcaPlot(pathways_pca_ctr, type = "scores", comp = 5:6,
+              colBy = data.frame(Tiempo = pathways_time),
+              labels = FALSE, ellipses = FALSE)
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+### Score plots — País
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(pathways_pca_ctr, type = "scores", comp = 1:2,
+              colBy = data.frame(Pais = pathways_meta$country),
+              labels = FALSE, ellipses = FALSE)
+p2 <- pcaPlot(pathways_pca_ctr, type = "scores", comp = 3:4,
+              colBy = data.frame(Pais = pathways_meta$country),
+              labels = FALSE, ellipses = FALSE)
+p3 <- pcaPlot(pathways_pca_ctr, type = "scores", comp = 5:6,
+              colBy = data.frame(Pais = pathways_meta$country),
+              labels = FALSE, ellipses = FALSE)
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+### Score plots — Modo de parto
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(pathways_pca_ctr, type = "scores", comp = 1:2,
+              colBy = data.frame(Parto = pathways_meta$Delivery_Mode),
+              labels = FALSE, ellipses = FALSE)
+p2 <- pcaPlot(pathways_pca_ctr, type = "scores", comp = 3:4,
+              colBy = data.frame(Parto = pathways_meta$Delivery_Mode),
+              labels = FALSE, ellipses = FALSE)
+p3 <- pcaPlot(pathways_pca_ctr, type = "scores", comp = 5:6,
+              colBy = data.frame(Parto = pathways_meta$Delivery_Mode),
+              labels = FALSE, ellipses = FALSE)
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+### Score plots — Tipo de alimentación
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(pathways_pca_ctr, type = "scores", comp = 1:2,
+              colBy = data.frame(Alimentacion = pathways_meta$Feeding_Type),
+              labels = FALSE, ellipses = FALSE)
+p2 <- pcaPlot(pathways_pca_ctr, type = "scores", comp = 3:4,
+              colBy = data.frame(Alimentacion = pathways_meta$Feeding_Type),
+              labels = FALSE, ellipses = FALSE)
+p3 <- pcaPlot(pathways_pca_ctr, type = "scores", comp = 5:6,
+              colBy = data.frame(Alimentacion = pathways_meta$Feeding_Type),
+              labels = FALSE, ellipses = FALSE)
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+### Score plots — Sexo
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(pathways_pca_ctr, type = "scores", comp = 1:2,
+              colBy = data.frame(Sexo = pathways_meta$Gender),
+              labels = FALSE, ellipses = FALSE)
+p2 <- pcaPlot(pathways_pca_ctr, type = "scores", comp = 3:4,
+              colBy = data.frame(Sexo = pathways_meta$Gender),
+              labels = FALSE, ellipses = FALSE)
+p3 <- pcaPlot(pathways_pca_ctr, type = "scores", comp = 5:6,
+              colBy = data.frame(Sexo = pathways_meta$Gender),
+              labels = FALSE, ellipses = FALSE)
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+### Loadings — Correlation plots
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+l1 <- pcaPlot(pathways_pca_ctr, type = "corr", comp = 1:2,
+              colBy = "contrib", shape = "point", labels = FALSE, repel = TRUE, col = "hot")
+l2 <- pcaPlot(pathways_pca_ctr, type = "corr", comp = 3:4,
+              colBy = "contrib", shape = "point", labels = FALSE, repel = TRUE, col = "hot")
+l3 <- pcaPlot(pathways_pca_ctr, type = "corr", comp = 5:6,
+              colBy = "contrib", shape = "point", labels = FALSE, repel = TRUE, col = "hot")
+grid.arrange(l1, l2, l3, ncol = 3)
+```
+
+### Loadings — Top 10 pathways
+
+**PC1 y PC2**
+
+```{r}
+tibble(
+  variable    = rownames(pathways_pca_ctr$loadings),
+  loading_PC1 = pathways_pca_ctr$loadings[, 1],
+  loading_PC2 = pathways_pca_ctr$loadings[, 2]
+) %>%
+  mutate(contribution_PC12 = loading_PC1^2 + loading_PC2^2) %>%
+  arrange(desc(contribution_PC12)) %>%
+  slice_head(n = 10) %>%
+  kable(caption = "Centrado — Top 10 pathways PC1/PC2")
+```
+
+**PC3 y PC4**
+
+```{r}
+tibble(
+  variable    = rownames(pathways_pca_ctr$loadings),
+  loading_PC3 = pathways_pca_ctr$loadings[, 3],
+  loading_PC4 = pathways_pca_ctr$loadings[, 4]
+) %>%
+  mutate(contribution_PC34 = loading_PC3^2 + loading_PC4^2) %>%
+  arrange(desc(contribution_PC34)) %>%
+  slice_head(n = 10) %>%
+  kable(caption = "Centrado — Top 10 pathways PC3/PC4")
+```
+
+**PC5 y PC6**
+
+```{r}
+tibble(
+  variable    = rownames(pathways_pca_ctr$loadings),
+  loading_PC5 = pathways_pca_ctr$loadings[, 5],
+  loading_PC6 = pathways_pca_ctr$loadings[, 6]
+) %>%
+  mutate(contribution_PC56 = loading_PC5^2 + loading_PC6^2) %>%
+  arrange(desc(contribution_PC56)) %>%
+  slice_head(n = 10) %>%
+  kable(caption = "Centrado — Top 10 pathways PC5/PC6")
+```
+
+```{r}
+pathways_pca_ctr <- pca(
+  pathways_X,
+  ncomp   = 2,
+  algo    = "nipals",
+  scaling = "center"
+)
+```
+
+### Detección de muestras anómalas (centrado)
+
+```{r fig.width=10, fig.height=4}
+par(mfrow = c(1, 2))
+
+pathways_out_RSS_ctr <- pcaOutliers(pathways_pca_ctr, ncomp = pathways_pca_ctr$ncomp, method = "RSS", conf = 0.95)
+pathways_out_T2_ctr  <- pcaOutliers(pathways_pca_ctr, ncomp = pathways_pca_ctr$ncomp, method = "T2",  conf = 0.95)
+
+par(mfrow = c(1, 1))
+```
+
+```{r}
+pathways_moderate_ctr <- sort(
+  pathways_out_RSS_ctr$RSS[pathways_out_RSS_ctr$ModerateOutliers],
+  decreasing = TRUE
+)
+
+pathways_severe_ctr <- sort(
+  pathways_out_T2_ctr$T2[pathways_out_T2_ctr$SevereOutliers],
+  decreasing = TRUE
+)
+
+cat("Anómalos moderados (RSS) al 95 :\n"); print(pathways_moderate_ctr)
+cat("\nAnómalos severos (T²) al 95 :\n");   print(pathways_severe_ctr)
+```
+
+```{r}
+par(mfrow = c(1, 2))
+
+pathways_out_RSS_99_ctr <- pcaOutliers(pathways_pca_ctr, ncomp = pathways_pca_ctr$ncomp, method = "RSS", conf = 0.99)
+pathways_out_T2_99_ctr  <- pcaOutliers(pathways_pca_ctr, ncomp = pathways_pca_ctr$ncomp, method = "T2",  conf = 0.99)
+
+par(mfrow = c(1, 1))
+```
+
+```{r}
+pw_moderate_99_ctr <- sort(pathways_out_RSS_99_ctr$RSS[pathways_out_RSS_99_ctr$ModerateOutliers], decreasing = TRUE)
+pw_severe_99_ctr   <- sort(pathways_out_T2_99_ctr$T2[pathways_out_T2_99_ctr$SevereOutliers], decreasing = TRUE)
+
+cat("Moderados (RSS) al 99 :\n"); print(pw_moderate_99_ctr)
+cat("Severos   (T²) al 99 :\n");  print(pw_severe_99_ctr)
+```
+
+```{r}
+pw_mod_contrib_99_ctr <- outlierContrib(pathways_pca_ctr, pathways_out_RSS_99_ctr)
+pw_top10_moderate_ctr <- get_top_contrib_list(pw_mod_contrib_99_ctr$contribRSS)
+pw_top10_moderate_ctr
+```
+
+```{r}
+pw_sev_contrib_99_ctr <- outlierContrib(pathways_pca_ctr, pathways_out_T2_99_ctr)
+pw_top10_severe_ctr   <- get_top_contrib_list(pw_sev_contrib_99_ctr$contribT2)
+pw_top10_severe_ctr
+```
+
+## Escalado estándar (`scaling = "standard"`)
+
+### Cálculo y scree plot
+
+```{r}
+pathways_pca_std <- pca(pathways_X, ncomp = NULL, algo = "nipals", scaling = "standard")
+pcaPlot(pathways_pca_std, type = "scree") +
+  ggtitle("Rutas — Varianza explicada por componente (escalado estándar)")
+```
+
+### Score plots — Exposición ambiental
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(pathways_pca_std, type = "scores", comp = 1:2,
+              colBy = data.frame(Exposicion = pathways_meta$Exposure_to_Environmental_Factors),
+              labels = FALSE, ellipses = FALSE)
+p2 <- pcaPlot(pathways_pca_std, type = "scores", comp = 3:4,
+              colBy = data.frame(Exposicion = pathways_meta$Exposure_to_Environmental_Factors),
+              labels = FALSE, ellipses = FALSE)
+p3 <- pcaPlot(pathways_pca_std, type = "scores", comp = 5:6,
+              colBy = data.frame(Exposicion = pathways_meta$Exposure_to_Environmental_Factors),
+              labels = FALSE, ellipses = FALSE)
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+### Score plots — Riesgo genético
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(pathways_pca_std, type = "scores", comp = 1:2,
+              colBy = data.frame(Riesgo_Genetico = pathways_meta$Genetic_Risk_Group),
+              labels = FALSE, ellipses = FALSE)
+p2 <- pcaPlot(pathways_pca_std, type = "scores", comp = 3:4,
+              colBy = data.frame(Riesgo_Genetico = pathways_meta$Genetic_Risk_Group),
+              labels = FALSE, ellipses = FALSE)
+p3 <- pcaPlot(pathways_pca_std, type = "scores", comp = 5:6,
+              colBy = data.frame(Riesgo_Genetico = pathways_meta$Genetic_Risk_Group),
+              labels = FALSE, ellipses = FALSE)
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+### Score plots — Tiempo
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(pathways_pca_std, type = "scores", comp = 1:2,
+              colBy = data.frame(Tiempo = pathways_time),
+              labels = FALSE, ellipses = FALSE)
+p2 <- pcaPlot(pathways_pca_std, type = "scores", comp = 3:4,
+              colBy = data.frame(Tiempo = pathways_time),
+              labels = FALSE, ellipses = FALSE)
+p3 <- pcaPlot(pathways_pca_std, type = "scores", comp = 5:6,
+              colBy = data.frame(Tiempo = pathways_time),
+              labels = FALSE, ellipses = FALSE)
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+### Score plots — País
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(pathways_pca_std, type = "scores", comp = 1:2,
+              colBy = data.frame(Pais = pathways_meta$country),
+              labels = FALSE, ellipses = FALSE)
+p2 <- pcaPlot(pathways_pca_std, type = "scores", comp = 3:4,
+              colBy = data.frame(Pais = pathways_meta$country),
+              labels = FALSE, ellipses = FALSE)
+p3 <- pcaPlot(pathways_pca_std, type = "scores", comp = 5:6,
+              colBy = data.frame(Pais = pathways_meta$country),
+              labels = FALSE, ellipses = FALSE)
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+### Score plots — Modo de parto
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(pathways_pca_std, type = "scores", comp = 1:2,
+              colBy = data.frame(Parto = pathways_meta$Delivery_Mode),
+              labels = FALSE, ellipses = FALSE)
+p2 <- pcaPlot(pathways_pca_std, type = "scores", comp = 3:4,
+              colBy = data.frame(Parto = pathways_meta$Delivery_Mode),
+              labels = FALSE, ellipses = FALSE)
+p3 <- pcaPlot(pathways_pca_std, type = "scores", comp = 5:6,
+              colBy = data.frame(Parto = pathways_meta$Delivery_Mode),
+              labels = FALSE, ellipses = FALSE)
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+### Score plots — Tipo de alimentación
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(pathways_pca_std, type = "scores", comp = 1:2,
+              colBy = data.frame(Alimentacion = pathways_meta$Feeding_Type),
+              labels = FALSE, ellipses = FALSE)
+p2 <- pcaPlot(pathways_pca_std, type = "scores", comp = 3:4,
+              colBy = data.frame(Alimentacion = pathways_meta$Feeding_Type),
+              labels = FALSE, ellipses = FALSE)
+p3 <- pcaPlot(pathways_pca_std, type = "scores", comp = 5:6,
+              colBy = data.frame(Alimentacion = pathways_meta$Feeding_Type),
+              labels = FALSE, ellipses = FALSE)
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+### Score plots — Sexo
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(pathways_pca_std, type = "scores", comp = 1:2,
+              colBy = data.frame(Sexo = pathways_meta$Gender),
+              labels = FALSE, ellipses = FALSE)
+p2 <- pcaPlot(pathways_pca_std, type = "scores", comp = 3:4,
+              colBy = data.frame(Sexo = pathways_meta$Gender),
+              labels = FALSE, ellipses = FALSE)
+p3 <- pcaPlot(pathways_pca_std, type = "scores", comp = 5:6,
+              colBy = data.frame(Sexo = pathways_meta$Gender),
+              labels = FALSE, ellipses = FALSE)
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+### Loadings — Correlation plots
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+l1 <- pcaPlot(pathways_pca_std, type = "corr", comp = 1:2,
+              colBy = "contrib", shape = "point", labels = FALSE, repel = TRUE, col = "hot")
+l2 <- pcaPlot(pathways_pca_std, type = "corr", comp = 3:4,
+              colBy = "contrib", shape = "point", labels = FALSE, repel = TRUE, col = "hot")
+l3 <- pcaPlot(pathways_pca_std, type = "corr", comp = 5:6,
+              colBy = "contrib", shape = "point", labels = FALSE, repel = TRUE, col = "hot")
+grid.arrange(l1, l2, l3, ncol = 3)
+```
+
+### Loadings — Top 10 pathways
+
+**PC1 y PC2**
+
+```{r}
+tibble(
+  variable    = rownames(pathways_pca_std$loadings),
+  loading_PC1 = pathways_pca_std$loadings[, 1],
+  loading_PC2 = pathways_pca_std$loadings[, 2]
+) %>%
+  mutate(contribution_PC12 = loading_PC1^2 + loading_PC2^2) %>%
+  arrange(desc(contribution_PC12)) %>%
+  slice_head(n = 10) %>%
+  kable(caption = "Estándar — Top 10 pathways PC1/PC2")
+```
+
+**PC3 y PC4**
+
+```{r}
+tibble(
+  variable    = rownames(pathways_pca_std$loadings),
+  loading_PC3 = pathways_pca_std$loadings[, 3],
+  loading_PC4 = pathways_pca_std$loadings[, 4]
+) %>%
+  mutate(contribution_PC34 = loading_PC3^2 + loading_PC4^2) %>%
+  arrange(desc(contribution_PC34)) %>%
+  slice_head(n = 10) %>%
+  kable(caption = "Estándar — Top 10 pathways PC3/PC4")
+```
+
+**PC5 y PC6**
+
+```{r}
+tibble(
+  variable    = rownames(pathways_pca_std$loadings),
+  loading_PC5 = pathways_pca_std$loadings[, 5],
+  loading_PC6 = pathways_pca_std$loadings[, 6]
+) %>%
+  mutate(contribution_PC56 = loading_PC5^2 + loading_PC6^2) %>%
+  arrange(desc(contribution_PC56)) %>%
+  slice_head(n = 10) %>%
+  kable(caption = "Estándar — Top 10 pathways PC5/PC6")
+```
+
+```{r}
+top_loadings_pc(pathways_pca_std, 1, n = 10)
+```
+
+
+```{r}
+top_loadings_pc(pathways_pca_std, 2, n = 10)
+```
+
+
+```{r}
+top_loadings_pc(pathways_pca_std, 3, n = 10)
+```
+
+
+```{r}
+top_loadings_pc(pathways_pca_std, 4, n = 10)
+```
+
+
+```{r}
+pathways_pca_std <- pca(
+  pathways_X,
+  ncomp   = 2,
+  algo    = "nipals",
+  scaling = "standard"
+)
+
+```
+
+## 4.4 Detección de muestras anómalas
+
+Se detectan muestras anómalas mediante dos criterios complementarios. El RSS y el T² de Hotelling. Las muestras detectadas se identifican pero **no se eliminan**.
+
+```{r fig.width=10, fig.height=4}
+par(mfrow = c(1, 2))
+
+pathways_out_RSS <- pcaOutliers(pathways_pca_std, ncomp = pathways_pca_std$ncomp,method = "RSS", conf = 0.95)
+pathways_out_T2  <- pcaOutliers(pathways_pca_std, ncomp = pathways_pca_std$ncomp,method = "T2",  conf = 0.95)
+
+par(mfrow = c(1, 1))
+```
+
+```{r}
+pathways_moderate <- sort(
+  pathways_out_RSS$RSS[pathways_out_RSS$ModerateOutliers],
+  decreasing = TRUE
+)
+
+pathways_severe <- sort(
+  pathways_out_T2$T2[pathways_out_T2$SevereOutliers],
+  decreasing = TRUE
+)
+
+cat("Anómalos moderados (RSS) al 95 :\n"); print(pathways_moderate)
+cat("\nAnómalos severos (T²) al 95 :\n");   print(pathways_severe)
+```
+
+```{r}
+par(mfrow = c(1, 2))
+
+pathways_out_RSS_99 <- pcaOutliers(pathways_pca_std, ncomp = pathways_pca_std$ncomp,method = "RSS", conf = 0.99)
+pathways_out_T2_99  <- pcaOutliers(pathways_pca_std, ncomp = pathways_pca_std$ncomp,method = "T2",  conf = 0.99)
+
+par(mfrow = c(1, 1))
+```
+
+
+```{r}
+pw_moderate_99 <- sort(pathways_out_RSS_99$RSS[pathways_out_RSS_99$ModerateOutliers],decreasing = TRUE)
+pw_severe_99   <- sort(pathways_out_T2_99$T2[pathways_out_T2_99$SevereOutliers],decreasing = TRUE)
+
+cat("Moderados (RSS) al 99 :\n"); print(pw_moderate_99)
+cat("Severos   (T²) al 99 :\n");  print(pw_severe_99)
+```
+```{r}
+pw_mod_contrib_99 <- outlierContrib(pathways_pca_std, pathways_out_RSS_99)
+pw_top10_moderate <- get_top_contrib_list(pw_mod_contrib_99$contribRSS)
+pw_top10_moderate
+```
+
+
+```{r}
+pw_sev_contrib_99 <- outlierContrib(pathways_pca_std, pathways_out_T2_99)
+```
+
+
+```{r}
+pw_top10_severe <-get_top_contrib_list(pw_sev_contrib_99$contribT2)
+
+pw_top10_severe
+```
+---
+
+# PCA — Metabolites
+
+## Escalado centrado (`scaling = "center"`)
+
+```{r}
+metabolites_pca_ctr <- pca(metabolites_X, ncomp = NULL, algo = "nipals", scaling = "center")
+pcaPlot(metabolites_pca_ctr, type = "scree") +
+  ggtitle("Metabolitos — Varianza explicada por componente (centrado)")
+```
+
+### Score plots — Exposición ambiental
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(metabolites_pca_ctr, type = "scores", comp = 1:2,
+              colBy = data.frame(Exposicion = metabolites_meta$Exposure_to_Environmental_Factors),
+              labels = FALSE, ellipses = FALSE)
+p2 <- pcaPlot(metabolites_pca_ctr, type = "scores", comp = 3:4,
+              colBy = data.frame(Exposicion = metabolites_meta$Exposure_to_Environmental_Factors),
+              labels = FALSE, ellipses = FALSE)
+p3 <- pcaPlot(metabolites_pca_ctr, type = "scores", comp = 5:6,
+              colBy = data.frame(Exposicion = metabolites_meta$Exposure_to_Environmental_Factors),
+              labels = FALSE, ellipses = FALSE)
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+### Score plots — Riesgo genético
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(metabolites_pca_ctr, type = "scores", comp = 1:2,
+              colBy = data.frame(Riesgo_Genetico = metabolites_meta$Genetic_Risk_Group),
+              labels = FALSE, ellipses = FALSE)
+p2 <- pcaPlot(metabolites_pca_ctr, type = "scores", comp = 3:4,
+              colBy = data.frame(Riesgo_Genetico = metabolites_meta$Genetic_Risk_Group),
+              labels = FALSE, ellipses = FALSE)
+p3 <- pcaPlot(metabolites_pca_ctr, type = "scores", comp = 5:6,
+              colBy = data.frame(Riesgo_Genetico = metabolites_meta$Genetic_Risk_Group),
+              labels = FALSE, ellipses = FALSE)
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+### Score plots — Tiempo
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(metabolites_pca_ctr, type = "scores", comp = 1:2,
+              colBy = data.frame(Tiempo = metabolites_time),
+              labels = FALSE, ellipses = FALSE)
+p2 <- pcaPlot(metabolites_pca_ctr, type = "scores", comp = 3:4,
+              colBy = data.frame(Tiempo = metabolites_time),
+              labels = FALSE, ellipses = FALSE)
+p3 <- pcaPlot(metabolites_pca_ctr, type = "scores", comp = 5:6,
+              colBy = data.frame(Tiempo = metabolites_time),
+              labels = FALSE, ellipses = FALSE)
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+### Score plots — País
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(metabolites_pca_ctr, type = "scores", comp = 1:2,
+              colBy = data.frame(Pais = metabolites_meta$country),
+              labels = FALSE, ellipses = FALSE)
+p2 <- pcaPlot(metabolites_pca_ctr, type = "scores", comp = 3:4,
+              colBy = data.frame(Pais = metabolites_meta$country),
+              labels = FALSE, ellipses = FALSE)
+p3 <- pcaPlot(metabolites_pca_ctr, type = "scores", comp = 5:6,
+              colBy = data.frame(Pais = metabolites_meta$country),
+              labels = FALSE, ellipses = FALSE)
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+### Score plots — Modo de parto
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(metabolites_pca_ctr, type = "scores", comp = 1:2,
+              colBy = data.frame(Parto = metabolites_meta$Delivery_Mode),
+              labels = FALSE, ellipses = FALSE)
+p2 <- pcaPlot(metabolites_pca_ctr, type = "scores", comp = 3:4,
+              colBy = data.frame(Parto = metabolites_meta$Delivery_Mode),
+              labels = FALSE, ellipses = FALSE)
+p3 <- pcaPlot(metabolites_pca_ctr, type = "scores", comp = 5:6,
+              colBy = data.frame(Parto = metabolites_meta$Delivery_Mode),
+              labels = FALSE, ellipses = FALSE)
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+### Score plots — Tipo de alimentación
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(metabolites_pca_ctr, type = "scores", comp = 1:2,
+              colBy = data.frame(Alimentacion = metabolites_meta$Feeding_Type),
+              labels = FALSE, ellipses = FALSE)
+p2 <- pcaPlot(metabolites_pca_ctr, type = "scores", comp = 3:4,
+              colBy = data.frame(Alimentacion = metabolites_meta$Feeding_Type),
+              labels = FALSE, ellipses = FALSE)
+p3 <- pcaPlot(metabolites_pca_ctr, type = "scores", comp = 5:6,
+              colBy = data.frame(Alimentacion = metabolites_meta$Feeding_Type),
+              labels = FALSE, ellipses = FALSE)
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+### Score plots — Sexo
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(metabolites_pca_ctr, type = "scores", comp = 1:2,
+              colBy = data.frame(Sexo = metabolites_meta$Gender),
+              labels = FALSE, ellipses = FALSE)
+p2 <- pcaPlot(metabolites_pca_ctr, type = "scores", comp = 3:4,
+              colBy = data.frame(Sexo = metabolites_meta$Gender),
+              labels = FALSE, ellipses = FALSE)
+p3 <- pcaPlot(metabolites_pca_ctr, type = "scores", comp = 5:6,
+              colBy = data.frame(Sexo = metabolites_meta$Gender),
+              labels = FALSE, ellipses = FALSE)
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+### Loadings — Correlation plots
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+l1 <- pcaPlot(metabolites_pca_ctr, type = "corr", comp = 1:2,
+              colBy = "contrib", shape = "point", labels = FALSE, repel = TRUE, col = "hot")
+l2 <- pcaPlot(metabolites_pca_ctr, type = "corr", comp = 3:4,
+              colBy = "contrib", shape = "point", labels = FALSE, repel = TRUE, col = "hot")
+l3 <- pcaPlot(metabolites_pca_ctr, type = "corr", comp = 5:6,
+              colBy = "contrib", shape = "point", labels = FALSE, repel = TRUE, col = "hot")
+grid.arrange(l1, l2, l3, ncol = 3)
+```
+
+### Loadings — Top 10 metabolitos
+
+**PC1 y PC2**
+
+```{r}
+tibble(
+  variable    = rownames(metabolites_pca_ctr$loadings),
+  loading_PC1 = metabolites_pca_ctr$loadings[, 1],
+  loading_PC2 = metabolites_pca_ctr$loadings[, 2]
+) %>%
+  mutate(contribution_PC12 = loading_PC1^2 + loading_PC2^2) %>%
+  arrange(desc(contribution_PC12)) %>%
+  slice_head(n = 10) %>%
+  kable(caption = "Centrado — Top 10 metabolitos PC1/PC2")
+```
+
+**PC3 y PC4**
+
+```{r}
+tibble(
+  variable    = rownames(metabolites_pca_ctr$loadings),
+  loading_PC3 = metabolites_pca_ctr$loadings[, 3],
+  loading_PC4 = metabolites_pca_ctr$loadings[, 4]
+) %>%
+  mutate(contribution_PC34 = loading_PC3^2 + loading_PC4^2) %>%
+  arrange(desc(contribution_PC34)) %>%
+  slice_head(n = 10) %>%
+  kable(caption = "Centrado — Top 10 metabolitos PC3/PC4")
+```
+
+**PC5 y PC6**
+
+```{r}
+tibble(
+  variable    = rownames(metabolites_pca_ctr$loadings),
+  loading_PC5 = metabolites_pca_ctr$loadings[, 5],
+  loading_PC6 = metabolites_pca_ctr$loadings[, 6]
+) %>%
+  mutate(contribution_PC56 = loading_PC5^2 + loading_PC6^2) %>%
+  arrange(desc(contribution_PC56)) %>%
+  slice_head(n = 10) %>%
+  kable(caption = "Centrado — Top 10 metabolitos PC5/PC6")
+```
+
+```{r}
+metab_pca_ctr <- pca(
+  metabolites_X,
+  ncomp   = 4,
+  algo    = "nipals",
+  scaling = "center"
+)
+```
+
+### Detección de muestras anómalas (centrado)
+
+```{r fig.width=10, fig.height=4}
+par(mfrow = c(1, 2))
+
+metab_out_RSS_ctr <- pcaOutliers(metab_pca_ctr, ncomp = metab_pca_ctr$ncomp, method = "RSS", conf = 0.95)
+metab_out_T2_ctr  <- pcaOutliers(metab_pca_ctr, ncomp = metab_pca_ctr$ncomp, method = "T2",  conf = 0.95)
+
+par(mfrow = c(1, 1))
+```
+
+```{r}
+metab_moderate_ctr <- sort(
+  metab_out_RSS_ctr$RSS[metab_out_RSS_ctr$ModerateOutliers],
+  decreasing = TRUE
+)
+
+metab_severe_ctr <- sort(
+  metab_out_T2_ctr$T2[metab_out_T2_ctr$SevereOutliers],
+  decreasing = TRUE
+)
+
+cat("Anómalos moderados (RSS) al 95 :\n"); print(metab_moderate_ctr)
+cat("\nAnómalos severos (T²) al 95 :\n");   print(metab_severe_ctr)
+```
+
+```{r}
+par(mfrow = c(1, 2))
+
+metab_out_RSS_99_ctr <- pcaOutliers(metab_pca_ctr, ncomp = metab_pca_ctr$ncomp, method = "RSS", conf = 0.99)
+metab_out_T2_99_ctr  <- pcaOutliers(metab_pca_ctr, ncomp = metab_pca_ctr$ncomp, method = "T2",  conf = 0.99)
+
+par(mfrow = c(1, 1))
+```
+
+```{r}
+metab_moderate_99_ctr <- sort(metab_out_RSS_99_ctr$RSS[metab_out_RSS_99_ctr$ModerateOutliers], decreasing = TRUE)
+metab_severe_99_ctr   <- sort(metab_out_T2_99_ctr$T2[metab_out_T2_99_ctr$SevereOutliers], decreasing = TRUE)
+
+cat("Moderados (RSS) al 99 :\n"); print(metab_moderate_99_ctr)
+cat("Severos   (T²) al 99 :\n");  print(metab_severe_99_ctr)
+```
+
+```{r}
+metab_mod_contrib_99_ctr <- outlierContrib(metab_pca_ctr, metab_out_RSS_99_ctr)
+metab_top10_moderate_ctr <- get_top_contrib_list(metab_mod_contrib_99_ctr$contribRSS)
+metab_top10_moderate_ctr
+```
+
+```{r}
+metab_sev_contrib_99_ctr <- outlierContrib(metab_pca_ctr, metab_out_T2_99_ctr)
+metab_top10_severe_ctr   <- get_top_contrib_list(metab_sev_contrib_99_ctr$contribT2)
+metab_top10_severe_ctr
+```
+
+## Escalado estándar (`scaling = "standard"`)
+
+### Cálculo y scree plot
+
+```{r}
+metabolites_pca_std <- pca(metabolites_X, ncomp = NULL, algo = "nipals", scaling = "standard")
+pcaPlot(metabolites_pca_std, type = "scree") +
+  ggtitle("Metabolitos — Varianza explicada por componente (escalado estándar)")
+```
+
+### Score plots — Exposición ambiental
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(metabolites_pca_std, type = "scores", comp = 1:2,
+              colBy = data.frame(Exposicion = metabolites_meta$Exposure_to_Environmental_Factors),
+              labels = FALSE, ellipses = FALSE)
+p2 <- pcaPlot(metabolites_pca_std, type = "scores", comp = 3:4,
+              colBy = data.frame(Exposicion = metabolites_meta$Exposure_to_Environmental_Factors),
+              labels = FALSE, ellipses = FALSE)
+p3 <- pcaPlot(metabolites_pca_std, type = "scores", comp = 5:6,
+              colBy = data.frame(Exposicion = metabolites_meta$Exposure_to_Environmental_Factors),
+              labels = FALSE, ellipses = FALSE)
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+### Score plots — Riesgo genético
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(metabolites_pca_std, type = "scores", comp = 1:2,
+              colBy = data.frame(Riesgo_Genetico = metabolites_meta$Genetic_Risk_Group),
+              labels = FALSE, ellipses = FALSE)
+p2 <- pcaPlot(metabolites_pca_std, type = "scores", comp = 3:4,
+              colBy = data.frame(Riesgo_Genetico = metabolites_meta$Genetic_Risk_Group),
+              labels = FALSE, ellipses = FALSE)
+p3 <- pcaPlot(metabolites_pca_std, type = "scores", comp = 5:6,
+              colBy = data.frame(Riesgo_Genetico = metabolites_meta$Genetic_Risk_Group),
+              labels = FALSE, ellipses = FALSE)
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+### Score plots — Tiempo
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(metabolites_pca_std, type = "scores", comp = 1:2,
+              colBy = data.frame(Tiempo = metabolites_time),
+              labels = FALSE, ellipses = FALSE)
+p2 <- pcaPlot(metabolites_pca_std, type = "scores", comp = 3:4,
+              colBy = data.frame(Tiempo = metabolites_time),
+              labels = FALSE, ellipses = FALSE)
+p3 <- pcaPlot(metabolites_pca_std, type = "scores", comp = 5:6,
+              colBy = data.frame(Tiempo = metabolites_time),
+              labels = FALSE, ellipses = FALSE)
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+### Score plots — País
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(metabolites_pca_std, type = "scores", comp = 1:2,
+              colBy = data.frame(Pais = metabolites_meta$country),
+              labels = FALSE, ellipses = FALSE)
+p2 <- pcaPlot(metabolites_pca_std, type = "scores", comp = 3:4,
+              colBy = data.frame(Pais = metabolites_meta$country),
+              labels = FALSE, ellipses = FALSE)
+p3 <- pcaPlot(metabolites_pca_std, type = "scores", comp = 5:6,
+              colBy = data.frame(Pais = metabolites_meta$country),
+              labels = FALSE, ellipses = FALSE)
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+### Score plots — Modo de parto
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(metabolites_pca_std, type = "scores", comp = 1:2,
+              colBy = data.frame(Parto = metabolites_meta$Delivery_Mode),
+              labels = FALSE, ellipses = FALSE)
+p2 <- pcaPlot(metabolites_pca_std, type = "scores", comp = 3:4,
+              colBy = data.frame(Parto = metabolites_meta$Delivery_Mode),
+              labels = FALSE, ellipses = FALSE)
+p3 <- pcaPlot(metabolites_pca_std, type = "scores", comp = 5:6,
+              colBy = data.frame(Parto = metabolites_meta$Delivery_Mode),
+              labels = FALSE, ellipses = FALSE)
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+### Score plots — Tipo de alimentación
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(metabolites_pca_std, type = "scores", comp = 1:2,
+              colBy = data.frame(Alimentacion = metabolites_meta$Feeding_Type),
+              labels = FALSE, ellipses = FALSE)
+p2 <- pcaPlot(metabolites_pca_std, type = "scores", comp = 3:4,
+              colBy = data.frame(Alimentacion = metabolites_meta$Feeding_Type),
+              labels = FALSE, ellipses = FALSE)
+p3 <- pcaPlot(metabolites_pca_std, type = "scores", comp = 5:6,
+              colBy = data.frame(Alimentacion = metabolites_meta$Feeding_Type),
+              labels = FALSE, ellipses = FALSE)
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+### Score plots — Sexo
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(metabolites_pca_std, type = "scores", comp = 1:2,
+              colBy = data.frame(Sexo = metabolites_meta$Gender),
+              labels = FALSE, ellipses = FALSE)
+p2 <- pcaPlot(metabolites_pca_std, type = "scores", comp = 3:4,
+              colBy = data.frame(Sexo = metabolites_meta$Gender),
+              labels = FALSE, ellipses = FALSE)
+p3 <- pcaPlot(metabolites_pca_std, type = "scores", comp = 5:6,
+              colBy = data.frame(Sexo = metabolites_meta$Gender),
+              labels = FALSE, ellipses = FALSE)
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+### Loadings — Correlation plots
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+l1 <- pcaPlot(metabolites_pca_std, type = "corr", comp = 1:2,
+              colBy = "contrib", shape = "point", labels = FALSE, repel = TRUE, col = "hot")
+l2 <- pcaPlot(metabolites_pca_std, type = "corr", comp = 3:4,
+              colBy = "contrib", shape = "point", labels = FALSE, repel = TRUE, col = "hot")
+l3 <- pcaPlot(metabolites_pca_std, type = "corr", comp = 5:6,
+              colBy = "contrib", shape = "point", labels = FALSE, repel = TRUE, col = "hot")
+grid.arrange(l1, l2, l3, ncol = 3)
+```
+
+### Loadings — Top 10 metabolitos
+
+**PC1 y PC2**
+
+```{r}
+tibble(
+  variable    = rownames(metabolites_pca_std$loadings),
+  loading_PC1 = metabolites_pca_std$loadings[, 1],
+  loading_PC2 = metabolites_pca_std$loadings[, 2]
+) %>%
+  mutate(contribution_PC12 = loading_PC1^2 + loading_PC2^2) %>%
+  arrange(desc(contribution_PC12)) %>%
+  slice_head(n = 10) %>%
+  kable(caption = "Estándar — Top 10 metabolitos PC1/PC2")
+```
+
+**PC3 y PC4**
+
+```{r}
+tibble(
+  variable    = rownames(metabolites_pca_std$loadings),
+  loading_PC3 = metabolites_pca_std$loadings[, 3],
+  loading_PC4 = metabolites_pca_std$loadings[, 4]
+) %>%
+  mutate(contribution_PC34 = loading_PC3^2 + loading_PC4^2) %>%
+  arrange(desc(contribution_PC34)) %>%
+  slice_head(n = 10) %>%
+  kable(caption = "Estándar — Top 10 metabolitos PC3/PC4")
+```
+
+**PC5 y PC6**
+
+```{r}
+tibble(
+  variable    = rownames(metabolites_pca_std$loadings),
+  loading_PC5 = metabolites_pca_std$loadings[, 5],
+  loading_PC6 = metabolites_pca_std$loadings[, 6]
+) %>%
+  mutate(contribution_PC56 = loading_PC5^2 + loading_PC6^2) %>%
+  arrange(desc(contribution_PC56)) %>%
+  slice_head(n = 10) %>%
+  kable(caption = "Estándar — Top 10 metabolitos PC5/PC6")
+```
+
+```{r}
+top_loadings_pc(metab_pca_std, 1, n = 10)
+```
+
+
+```{r}
+top_loadings_pc(metab_pca_std, 2, n = 10)
+```
+
+
+```{r}
+top_loadings_pc(metab_pca_std, 3, n = 10)
+```
+
+
+```{r}
+top_loadings_pc(metab_pca_std, 4, n = 10)
+```
+
+
+```{r}
+metab_pca_std <- pca(
+  metabolites_X,
+  ncomp   = 4,
+  algo    = "nipals",
+  scaling = "standard"
+)
+
+```
+
+## 4.4 Detección de muestras anómalas
+
+Se detectan muestras anómalas mediante dos criterios complementarios. El RSS y el T² de Hotelling. Las muestras detectadas se identifican pero **no se eliminan**.
+
+```{r fig.width=10, fig.height=4}
+par(mfrow = c(1, 2))
+
+metab_out_RSS <- pcaOutliers(metab_pca_std, ncomp = metab_pca_std$ncomp,method = "RSS", conf = 0.95)
+metab_out_T2  <- pcaOutliers(metab_pca_std, ncomp = metab_pca_std$ncomp,method = "T2",  conf = 0.95)
+
+par(mfrow = c(1, 1))
+```
+
+```{r}
+metab_moderate <- sort(
+  metab_out_RSS$RSS[metab_out_RSS$ModerateOutliers],
+  decreasing = TRUE
+)
+
+metab_severe <- sort(
+  metab_out_T2$T2[metab_out_T2$SevereOutliers],
+  decreasing = TRUE
+)
+
+cat("Anómalos moderados (RSS) al 95 :\n"); print(metab_moderate)
+cat("\nAnómalos severos (T²) al 95 :\n");   print(metab_severe)
+```
+
+```{r}
+par(mfrow = c(1, 2))
+
+metab_out_RSS_99 <- pcaOutliers(metab_pca_std, ncomp = metab_pca_std$ncomp,method = "RSS", conf = 0.99)
+metab_out_T2_99  <- pcaOutliers(metab_pca_std, ncomp = metab_pca_std$ncomp,method = "T2",  conf = 0.99)
+
+par(mfrow = c(1, 1))
+```
+
+
+```{r}
+metab_moderate_99 <- sort(metab_out_RSS_99$RSS[metab_out_RSS_99$ModerateOutliers],
+                    decreasing = TRUE)
+metab_severe_99   <- sort(metab_out_T2_99$T2[metab_out_T2_99$SevereOutliers],
+                    decreasing = TRUE)
+
+cat("Moderados (RSS) al 99 :\n"); print(metab_moderate_99)
+cat("Severos   (T²) al 99 :\n");  print(metab_severe_99)
+```
+
+
+```{r}
+metab_mod_contrib_99 <- outlierContrib(metab_pca_std, metab_out_RSS_99)
+```
+
+
+```{r}
+metab_sev_contrib_99 <- outlierContrib(metab_pca_std, metab_out_T2_99)
+```
+
+
+```{r}
+metab_top10_moderate <- get_top_contrib_list(metab_mod_contrib_99$contribRSS)
+
+
+metab_top10_moderate
+```
+
+```{r}
+metab_top10_severe <-get_top_contrib_list(metab_sev_contrib_99$contribT2)
+
+metab_top10_severe
+```

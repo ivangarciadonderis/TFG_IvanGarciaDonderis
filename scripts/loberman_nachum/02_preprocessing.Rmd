@@ -1,0 +1,250 @@
+---
+title: "Preprocesamiento — Loberman-Nachum et al. (2019)"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+date: "2026-06-30"
+---
+
+Este script transforma los conteos crudos de RNA-seq en una matriz de expresión normalizada y filtrada, lista para el análisis exploratorio y los modelos supervisados. El flujo de preprocesado consta de tres etapas: filtrado de genes proteicos, eliminación de genes de baja expresión mediante NOISeq, y normalización TMM seguida de transformación logarítmica.
+
+El paper original normaliza los conteos a RPM (Reads Per Million) y filtra los genes con RPM > 3 en al menos el 20% de las muestras, obteniendo 14.778 genes proteicos. En este análisis se opta por un flujo alternativo: filtrado con NOISeq (CPM > 1) y normalización TMM, que es metodológicamente más robusto porque NOISeq evalúa la variabilidad entre grupos además del umbral de expresión, y TMM corrige los sesgos de composición entre muestras que RPM no corrige. El número de genes resultante (14.347) es comparable al del paper.
+
+# Carga de librerías y datos
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(knitr)
+library(NOISeq)
+
+library(here)
+processed_dir <- here("data", "processed", "loberman_nachum")
+
+metadata        <- readRDS(file.path(processed_dir, "metadata.rds"))
+counts_matrix   <- readRDS(file.path(processed_dir, "counts_matrix_gene_x_sample.rds"))
+gene_annotation <- readRDS(file.path(processed_dir, "gene_annotation.rds"))
+
+dim(metadata)
+dim(counts_matrix)
+dim(gene_annotation)
+```
+
+# Verificación del orden de muestras
+
+Se comprueba que el orden de las columnas de la matriz de conteos coincide exactamente con el orden de las filas de los metadatos. Este paso es crítico porque todos los análisis posteriores asumen que la i-ésima columna de la matriz corresponde a la i-ésima fila de los metadatos.
+
+```{r}
+all(metadata$sample_id %in% colnames(counts_matrix))
+all(colnames(counts_matrix) %in% metadata$sample_id)
+
+counts_matrix <- counts_matrix[, metadata$sample_id]
+all(colnames(counts_matrix) == metadata$sample_id)
+```
+
+# Tamaño de librería
+
+El tamaño de librería de cada muestra (suma total de conteos) refleja la profundidad de secuenciación. Diferencias grandes entre muestras pueden introducir sesgos en las comparaciones de expresión si no se normalizan adecuadamente.
+
+```{r}
+library_sizes <- tibble(
+  sample_id    = colnames(counts_matrix),
+  library_size = colSums(counts_matrix)
+) %>%
+  left_join(metadata %>% dplyr::select(sample_id, group, cohort), by = "sample_id")
+
+summary(library_sizes$library_size)
+
+library_sizes %>%
+  arrange(library_size) %>%
+  kable(caption = "Tamaño de librería por muestra")
+```
+
+# Filtrado de genes proteicos
+
+Los datos de RNA-seq incluyen no solo genes que codifican proteínas sino también ARN no codificantes, pseudogenes y otros elementos del genoma. Para centrar el análisis en los genes con mayor relevancia biológica y funcional, se retienen únicamente los genes clasificados como protein-coding en la anotación del genoma humano.
+
+```{r}
+protein_coding_genes <- gene_annotation %>%
+  filter(str_detect(tolower(GeneType), "protein")) %>%
+  pull(GeneID) %>%
+  unique()
+
+counts_protein <- counts_matrix[rownames(counts_matrix) %in% protein_coding_genes, ]
+
+cat("Genes totales:         ", nrow(counts_matrix),  "\n")
+cat("Genes proteicos:       ", nrow(counts_protein),  "\n")
+cat("Genes no proteicos:    ", nrow(counts_matrix) - nrow(counts_protein), "\n")
+```
+
+# Filtrado de genes de baja expresión con NOISeq
+
+Los genes con expresión muy baja o nula en la mayoría de muestras no aportan información útil y añaden ruido estadístico que reduce la potencia de los análisis. Se aplica el filtrado de NOISeq con el criterio CPM > 1, que elimina genes cuya expresión normalizada no supera 1 cuenta por millón en ninguno de los grupos.
+
+Se compara además con el umbral CPM > 3 para justificar la elección del umbral más permisivo.
+
+```{r}
+group_factor <- metadata$group
+table(group_factor)
+```
+
+```{r}
+counts_filtered_cpm1 <- NOISeq::filtered.data(
+  dataset   = counts_protein,
+  factor    = group_factor,
+  norm      = FALSE,
+  method    = 1,
+  cpm       = 1,
+  cv.cutoff = 100
+)
+
+counts_filtered_cpm3 <- NOISeq::filtered.data(
+  dataset   = counts_protein,
+  factor    = group_factor,
+  norm      = FALSE,
+  method    = 1,
+  cpm       = 3,
+  cv.cutoff = 100
+)
+
+tibble(
+  filtro  = c("CPM > 1", "CPM > 3"),
+  n_genes = c(nrow(counts_filtered_cpm1), nrow(counts_filtered_cpm3))
+) %>%
+  kable(caption = "Comparación de umbrales de filtrado")
+```
+
+La diferencia entre ambos umbrales es de aproximadamente 1.200 genes. Se opta por CPM > 1 para ser conservadores y retener el mayor número de genes informativos, ya que el modelo PLS-DA posterior realizará su propia selección de variables relevantes.
+
+```{r}
+counts_filtered <- counts_filtered_cpm1
+```
+
+```{r}
+filter_summary <- tibble(
+  paso    = c("Genes iniciales", "Genes protein-coding",
+              "Genes tras filtro NOISeq CPM > 1"),
+  n_genes = c(nrow(counts_matrix), nrow(counts_protein), nrow(counts_filtered))
+)
+
+kable(filter_summary, caption = "Resumen del proceso de filtrado")
+```
+
+# Normalización TMM
+
+La normalización TMM (Trimmed Mean of M-values) corrige los sesgos de composición entre muestras: cuando una muestra tiene un subconjunto de genes muy sobreexpresados, los genes moderadamente expresados aparecerán artificialmente deprimidos respecto a otras muestras. TMM calcula factores de normalización para cada muestra que compensan estas diferencias de composición.
+
+```{r}
+counts_tmm <- NOISeq::tmm(
+  datos = counts_filtered,
+  long  = 1000,
+  lc    = 0,
+  k     = 0
+)
+
+dim(counts_tmm)
+counts_tmm[1:5, 1:5]
+```
+
+# Transformación logarítmica
+
+Los datos de expresión normalizados presentan una distribución muy sesgada a la derecha, con unos pocos genes muy altamente expresados y muchos con expresión moderada. La transformación log(x + 1) aproxima la distribución a la normalidad, estabiliza la varianza y hace que los datos sean más adecuados para los métodos multivariantes (PCA, PLS-DA) que asumen cierta simetría en la distribución.
+
+```{r}
+expression_log <- log(counts_tmm + 1)
+
+dim(expression_log)
+expression_log[1:5, 1:5]
+```
+
+# Comprobación de valores faltantes
+
+```{r}
+tibble(
+  objeto        = c("counts_filtered", "counts_tmm", "expression_log"),
+  total_missing = c(
+    sum(is.na(counts_filtered)),
+    sum(is.na(counts_tmm)),
+    sum(is.na(expression_log))
+  )
+) %>%
+  kable(caption = "Valores faltantes tras cada etapa de preprocesado")
+```
+
+# Reconstrucción del objeto final
+
+Se transpone la matriz para que las muestras queden en filas y los genes en columnas, y se une con los metadatos para disponer de un único objeto que contiene tanto la expresión génica como las variables clínicas de cada muestra.
+
+```{r}
+expression_log_sample_gene <- t(expression_log) %>%
+  as.data.frame(check.names = FALSE) %>%
+  rownames_to_column("sample_id") %>%
+  as_tibble()
+
+dim(expression_log_sample_gene)
+head(expression_log_sample_gene[, 1:6])
+```
+
+```{r}
+expression_log_data <- metadata %>%
+  left_join(expression_log_sample_gene, by = "sample_id")
+
+dim(expression_log_data)
+head(expression_log_data[, 1:10])
+```
+
+## Renombrado de genes por su símbolo (gene_label)
+
+Hasta ahora las matrices de expresión usan como identificador el `GeneID` numérico (Entrez), heredado de los datos crudos de GEO. Para que el resto de análisis (PCA, PLS-DA, tablas de resultados) sean legibles, se construye un `gene_label`: el símbolo del gen (`Symbol`) cuando existe, o el propio `GeneID` como respaldo si el gen no tiene símbolo anotado. Se comprueba que no haya símbolos duplicados antes de usarlos como nombres de fila, y finalmente se sustituyen los `GeneID` por sus `gene_label` en todas las matrices y en la tabla combinada `expression_log_data`.
+
+```{r}
+gene_annotation_filtered <- gene_annotation %>%
+  filter(GeneID %in% rownames(expression_log))
+
+dim(gene_annotation_filtered)
+head(gene_annotation_filtered)
+```
+
+
+```{r}
+gene_label_map <- gene_annotation_filtered %>%
+  mutate(gene_label = if_else(is.na(Symbol), GeneID, Symbol)) %>%
+  dplyr::select(GeneID, gene_label)
+
+sum(duplicated(gene_label_map$gene_label))
+```
+```{r}
+stopifnot(sum(duplicated(gene_label_map$gene_label)) == 0)
+
+label_from_id <- setNames(gene_label_map$gene_label, gene_label_map$GeneID)
+```
+
+
+```{r}
+rownames(counts_tmm)     <- label_from_id[rownames(counts_tmm)]
+rownames(expression_log) <- label_from_id[rownames(expression_log)]
+
+gene_cols <- setdiff(colnames(expression_log_data), colnames(metadata))
+colnames(expression_log_data)[colnames(expression_log_data) %in% gene_cols] <-
+  label_from_id[gene_cols]
+
+counts_tmm[1:5, 1:5]
+expression_log[1:5, 1:5]
+head(expression_log_data[, 1:15])
+```
+
+
+
+
+# Guardado de datos preprocesados
+
+```{r}
+saveRDS(counts_filtered,         file.path(processed_dir, "counts_filtered_gene_x_sample.rds"))
+saveRDS(counts_tmm,              file.path(processed_dir, "counts_tmm_gene_x_sample.rds"))
+saveRDS(expression_log,          file.path(processed_dir, "expression_log_gene_x_sample.rds"))
+saveRDS(expression_log_data,     file.path(processed_dir, "expression_log_data.rds"))
+saveRDS(gene_annotation_filtered, file.path(processed_dir, "gene_annotation_filtered.rds"))
+saveRDS(filter_summary,          file.path(processed_dir, "filter_summary.rds"))
+saveRDS(gene_label_map, file.path(processed_dir, "gene_label_map.rds"))
+```

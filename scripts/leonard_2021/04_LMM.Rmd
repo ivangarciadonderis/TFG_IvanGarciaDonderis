@@ -1,0 +1,404 @@
+---
+title: "Modelos Lineales Mixtos (LMM) — Leonard et al. (2021)"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+date: "2026-07-04"
+---
+
+# 1. Carga de librerías y lectura de datos preprocesados
+
+```{r}
+library(tidyverse)
+library(lme4)
+library(lmerTest)
+library(knitr)
+library(here)
+
+processed_dir <- here("data", "processed", "leonard_2021")
+
+species_clr_data     <- readRDS(file.path(processed_dir, "species_clr_data.rds"))
+pathways_clr_data    <- readRDS(file.path(processed_dir, "pathways_clr_data.rds"))
+metabolites_log_data <- readRDS(file.path(processed_dir, "metabolites_log_data.rds"))
+
+dim(species_clr_data)
+dim(pathways_clr_data)
+dim(metabolites_log_data)
+```
+
+# 2. Separación metadatos y variables ómicas
+
+```{r}
+metadata_cols <- c(
+  "sample_id", "PaperID", "group", "pair_id",
+  "time_label", "TimePoint", "relative_time_label",
+  "sample_month", "onset_month", "relative_month",
+  "Country", "Gender", "Delivery_Mode", "Genetic_Risk"
+)
+
+species_meta <- species_clr_data %>% select(any_of(metadata_cols))
+species_X_raw <- species_clr_data %>%
+  select(-any_of(metadata_cols)) %>%
+  mutate(across(everything(), as.numeric)) %>%
+  as.data.frame()
+rownames(species_X_raw) <- species_meta$sample_id
+
+species_X_scaled <- as.data.frame(scale(species_X_raw))
+```
+
+```{r}
+pathways_meta <- pathways_clr_data %>% select(any_of(metadata_cols))
+pathways_X_raw <- pathways_clr_data %>%
+  select(-any_of(metadata_cols)) %>%
+  mutate(across(everything(), as.numeric)) %>%
+  as.data.frame()
+rownames(pathways_X_raw) <- pathways_meta$sample_id
+
+pathways_X_scaled <- as.data.frame(scale(pathways_X_raw))
+```
+
+```{r}
+metabolites_meta <- metabolites_log_data %>% select(any_of(metadata_cols))
+metabolites_X_raw <- metabolites_log_data %>%
+  select(-any_of(metadata_cols)) %>%
+  mutate(across(everything(), as.numeric)) %>%
+  as.data.frame()
+rownames(metabolites_X_raw) <- metabolites_meta$sample_id
+
+metabolites_X_scaled <- as.data.frame(scale(metabolites_X_raw))
+```
+
+
+# 3. Ajuste de un LMM sobre una única variable (prueba piloto)
+
+Antes de automatizar el ajuste del modelo a las 144 especies, se prueba primero sobre una sola variable para verificar que el modelo está bien especificado y que la salida tiene el formato esperado.
+
+El modelo utilizado es:
+
+`abundancia ~ grupo + tiempo + grupo:tiempo + país + parto + (1 | sujeto)`
+
+- **Efectos fijos**: `group` (caso/control), `relative_month` (tiempo relativo al onset, en meses, tratado como variable continua), la interacción `group:relative_month` (para detectar si la trayectoria temporal difiere entre casos y controles), y dos covariables de ajuste (`Country`, `Delivery_Mode`).
+- **Efecto aleatorio**: `(1 | PaperID)`, un intercepto aleatorio por sujeto, necesario porque cada individuo aporta varias muestras a lo largo del tiempo (medidas repetidas).
+- `PaperID` se usa como identificador de sujeto (no `pair_id`), para no mezclar caso y control de la misma pareja como si fueran el mismo individuo.
+
+
+```{r}
+model_data <- species_meta %>%
+  select(PaperID, group, relative_month, Country, Delivery_Mode) %>%
+  mutate(relative_month_c = relative_month - mean(relative_month))
+
+fit_lmm <- function(y, data) {
+  data$y <- y
+  model <- lmer(
+    y ~ group + relative_month + group:relative_month + Country + Delivery_Mode + (1 | PaperID),
+    data = data
+  )
+  summary(model)$coefficients
+}
+
+test_result <- fit_lmm(species_X_scaled[[1]], model_data)
+test_result
+```
+
+`group` queda codificado con "Case" como nivel de referencia (orden alfabético por defecto de R), por lo que el coeficiente `groupControl` representa la diferencia Control−Case, y `groupControl:relative_month` representa cuánto difiere la pendiente temporal de los controles respecto a la de los casos (el grupo de referencia).
+
+Con `lmerTest` cargado, `summary(model)$coefficients` ya incluye la columna `Pr(>|t|)`, necesaria porque `lme4` por sí solo no proporciona p-valores para modelos mixtos.
+
+Este modelo piloto sirve para comprobar que el enfoque funciona; el modelo definitivo (sección siguiente) lo amplía con el término cuadrático del tiempo y su interacción con grupo.
+
+# 4. Función definitiva: ajuste + reestructuración a formato ancho
+
+Se amplía el modelo piloto anterior añadiendo el término cuadrático del tiempo y su interacción con `group`, para poder capturar trayectorias no lineales (por ejemplo, cambios que se aceleran cerca del diagnóstico en vez de una pendiente constante). El modelo definitivo queda:
+
+`abundancia ~ grupo + tiempo_centrado + tiempo_centrado² + grupo:tiempo_centrado + grupo:tiempo_centrado² + país + parto + (1 | sujeto)`
+
+**Por qué se centra el tiempo antes de elevarlo al cuadrado**: `relative_month` va de −18 a 0, nunca es positivo. Elevarlo al cuadrado sin centrar antes produce una correlación casi perfecta entre el término lineal y el cuadrático (r = −0.96 en este rango de valores), lo que infla los errores estándar de ambos términos y de sus interacciones con grupo (multicolinealidad severa). Centrando el tiempo (`relative_month_c = relative_month - mean(relative_month)`) antes de elevarlo al cuadrado, esa correlación se anula por completo (r = 0), evitando ese problema. 
+
+Se construye la función `tidy_lmm()`, que:
+
+1. Ajusta este modelo ampliado sobre la variable indicada, usando `relative_month_c` en vez de `relative_month`.
+2. Usa explícitamente `REML = TRUE` (estimación por máxima verosimilitud restringida). Es la opción por defecto de `lme4` y la recomendada para inferencia sobre efectos fijos combinada con `lmerTest`; `REML = FALSE` (máxima verosimilitud completa) tiende a producir errores estándar más pequeños y p-valores más liberales.
+3. Detecta si el ajuste es singular (`isSingular()`) — es decir, si la varianza estimada del efecto aleatorio es prácticamente cero para esa variable, lo que indica que sus p-valores son menos fiables. 
+4. Reestructura la tabla de coeficientes (que sale en formato largo, una fila por término del modelo) a una única fila con columnas `estimate_<término>` y `p_value_<término>`, una fila por variable con todos sus coeficientes y p-valores como columnas. El término `I(relative_month_c^2)` se renombra explícitamente a `relative_month_c2` antes de la limpieza general de nombres, ya que contiene un carácter (`^`) no válido en un nombre de columna.
+
+```{r}
+tidy_lmm <- function(y, data) {
+  data$y <- y
+
+  model <- suppressWarnings(
+    lmer(y ~ group + relative_month_c + I(relative_month_c^2) +
+           group:relative_month_c + group:I(relative_month_c^2) +
+           Country + Delivery_Mode + (1 | PaperID),
+         data = data, REML = TRUE)
+  )
+
+  coefs <- as.data.frame(summary(model)$coefficients)
+  coefs$term <- rownames(coefs)
+
+  coefs <- coefs %>%
+    rename(estimate = Estimate, p_value = `Pr(>|t|)`) %>%
+    mutate(term = term %>%
+             str_replace_all("I\\(relative_month_c\\^2\\)", "relative_month_c2") %>%
+             str_remove_all("[()]") %>%
+             str_replace_all(":", "_")) %>%
+    select(term, estimate, p_value)
+
+  wide <- coefs %>%
+    pivot_wider(names_from = term, values_from = c(estimate, p_value), names_glue = "{.value}_{term}")
+
+  wide$singular_fit <- isSingular(model)
+  wide
+}
+
+test_wide <- tidy_lmm(species_X_scaled[[1]], model_data)
+test_wide
+```
+
+# 5. Aplicación del LMM
+
+Se aplica `tidy_lmm()` a cada una de las variables (columnas) de `species_X_scaled` mediante `map_dfr()`, que itera la función sobre todas las especies y apila los resultados en una única tabla ancha (una fila por especie). Se añade el nombre de la variable como columna y se recoloca en primera posición.
+
+Se comprueba cuántas especies presentan ajuste singular, para tenerlas identificadas de cara a la interpretación posterior de los p-valores.
+
+Se aplica el mismo procedimiento para species, pathways y metabolitos.
+
+```{r}
+species_lmm_results <- map_dfr(
+  names(species_X_scaled),
+  function(var_name) {
+    result <- tidy_lmm(species_X_scaled[[var_name]], model_data)
+    result$variable <- var_name
+    result
+  }
+) %>%
+  relocate(variable)
+species_lmm_results %>% filter(singular_fit) %>% pull(variable)
+dim(species_lmm_results)
+head(species_lmm_results)
+```
+
+```{r}
+pathways_model_data <- pathways_meta %>%
+  select(PaperID, group, relative_month, Country, Delivery_Mode) %>%
+  mutate(relative_month_c = relative_month - mean(relative_month))
+
+pathways_lmm_results <- map_dfr(
+  names(pathways_X_scaled),
+  function(var_name) {
+    result <- tidy_lmm(pathways_X_scaled[[var_name]], pathways_model_data)
+    result$variable <- var_name
+    result
+  }
+) %>%
+  relocate(variable)
+
+dim(pathways_lmm_results)
+pathways_lmm_results %>% filter(singular_fit) %>% pull(variable)
+```
+
+```{r}
+metabolites_model_data <- metabolites_meta %>%
+  select(PaperID, group, relative_month, Country, Delivery_Mode) %>%
+  mutate(relative_month_c = relative_month - mean(relative_month))
+
+metabolites_lmm_results <- map_dfr(
+  names(metabolites_X_scaled),
+  function(var_name) {
+    result <- tidy_lmm(metabolites_X_scaled[[var_name]], metabolites_model_data)
+    result$variable <- var_name
+    result
+  }
+) %>%
+  relocate(variable)
+
+dim(metabolites_lmm_results)
+metabolites_lmm_results %>% filter(singular_fit) %>% pull(variable)
+```
+
+
+
+# 6. Variables significativas por coeficiente
+
+Para cada matriz (species, pathways, metabolites), se muestran las variables cuyo p-valor es significativo (< 0.05) para cada uno de los cinco coeficientes de interés: `grupo` (diferencia basal caso/control), `tiempo` (tendencia temporal general lineal), `tiempo²` (curvatura de la tendencia temporal general), `grupo:tiempo` (trayectoria lineal distinta entre casos y controles) y `grupo:tiempo²` (curvatura de la trayectoria distinta entre casos y controles).
+
+```{r}
+show_significant <- function(df, p_col, label) {
+  df %>%
+    filter(.data[[p_col]] < 0.05) %>%
+    select(variable, estimate = paste0("estimate_", str_remove(p_col, "^p_value_")), p_value = all_of(p_col)) %>%
+    arrange(p_value) %>%
+    mutate(coeficiente = label, .before = 1)
+}
+```
+
+## Species significativas por grupo
+
+```{r}
+species_sig_group <- show_significant(species_lmm_results, "p_value_groupControl", "grupo")
+species_sig_time  <- show_significant(species_lmm_results, "p_value_relative_month_c", "tiempo")
+species_sig_time2 <- show_significant(species_lmm_results, "p_value_relative_month_c2", "tiempo²")
+species_sig_inter <- show_significant(species_lmm_results, "p_value_groupControl_relative_month_c", "grupo:tiempo")
+species_sig_inter2 <- show_significant(species_lmm_results, "p_value_groupControl_relative_month_c2", "grupo:tiempo²")
+
+kable(species_sig_group)
+```
+
+## Species significativas por tiempo
+
+```{r}
+kable(species_sig_time)
+```
+
+## Species significativas por tiempo²
+
+```{r}
+kable(species_sig_time2)
+```
+
+## Species significativas por interacción grupo:tiempo
+
+```{r}
+kable(species_sig_inter)
+```
+
+## Species significativas por interacción grupo:tiempo²
+
+```{r}
+kable(species_sig_inter2)
+```
+
+## Pathways significativos por grupo
+
+```{r}
+pathways_sig_group <- show_significant(pathways_lmm_results, "p_value_groupControl", "grupo")
+pathways_sig_time  <- show_significant(pathways_lmm_results, "p_value_relative_month_c", "tiempo")
+pathways_sig_time2 <- show_significant(pathways_lmm_results, "p_value_relative_month_c2", "tiempo²")
+pathways_sig_inter <- show_significant(pathways_lmm_results, "p_value_groupControl_relative_month_c", "grupo:tiempo")
+pathways_sig_inter2 <- show_significant(pathways_lmm_results, "p_value_groupControl_relative_month_c2", "grupo:tiempo²")
+
+kable(pathways_sig_group)
+```
+
+## Pathways significativos por tiempo
+
+```{r}
+kable(pathways_sig_time)
+```
+
+## Pathways significativos por tiempo²
+
+```{r}
+kable(pathways_sig_time2)
+```
+
+## Pathways significativos por interacción grupo:tiempo
+
+```{r}
+kable(pathways_sig_inter)
+```
+
+## Pathways significativos por interacción grupo:tiempo²
+
+```{r}
+kable(pathways_sig_inter2)
+```
+
+## Metabolitos significativos por grupo
+
+```{r}
+metabolites_sig_group <- show_significant(metabolites_lmm_results, "p_value_groupControl", "grupo")
+metabolites_sig_time  <- show_significant(metabolites_lmm_results, "p_value_relative_month_c", "tiempo")
+metabolites_sig_time2 <- show_significant(metabolites_lmm_results, "p_value_relative_month_c2", "tiempo²")
+metabolites_sig_inter <- show_significant(metabolites_lmm_results, "p_value_groupControl_relative_month_c", "grupo:tiempo")
+metabolites_sig_inter2 <- show_significant(metabolites_lmm_results, "p_value_groupControl_relative_month_c2", "grupo:tiempo²")
+
+kable(metabolites_sig_group)
+```
+
+## Metabolitos significativos por tiempo
+
+```{r}
+kable(metabolites_sig_time)
+```
+
+## Metabolitos significativos por tiempo²
+
+```{r}
+kable(metabolites_sig_time2)
+```
+
+## Metabolitos significativos por interacción grupo:tiempo
+
+```{r}
+kable(metabolites_sig_inter)
+```
+
+## Metabolitos significativos por interacción grupo:tiempo²
+
+```{r}
+kable(metabolites_sig_inter2)
+```
+
+
+# 7. Selección de variables EC-specific
+
+Se define como **EC-specific** (relevante para la enfermedad celíaca) toda variable en la que al menos uno de los tres coeficientes relacionados con el grupo sea significativo (p < 0.05):
+
+- `groupControl`: diferencia basal de abundancia entre casos y controles (independiente del tiempo).
+- `groupControl:relative_month_c`: diferencia en la trayectoria temporal lineal entre casos y controles (interacción grupo×tiempo).
+- `groupControl:relative_month_c2`: diferencia en la curvatura de la trayectoria temporal entre casos y controles (interacción grupo×tiempo²) — captura patrones no lineales, por ejemplo una divergencia entre grupos que se acelera cerca del diagnóstico en vez de mantenerse constante.
+
+Quedan **excluidas** de esta categoría las variables cuya única significación provenga de `relative_month_c`, `relative_month_c2`, `Country` o `Delivery_Mode` sin que `group` ni ninguna de sus interacciones con el tiempo lo sean — es decir, variables que cambian con el tiempo o difieren por covariables demográficas, pero no de forma distinta entre casos y controles.
+
+
+```{r}
+species_lmm_results <- species_lmm_results %>%
+  mutate(EC_specific = p_value_groupControl < 0.05 |
+           p_value_groupControl_relative_month_c < 0.05 |
+           p_value_groupControl_relative_month_c2 < 0.05)
+
+variables_species     <- species_lmm_results     %>% filter(EC_specific) %>% pull(variable)
+
+
+cat("Species EC-specific:    ", length(variables_species), "\n")
+
+```
+
+
+```{r}
+pathways_lmm_results <- pathways_lmm_results %>%
+  mutate(EC_specific = p_value_groupControl < 0.05 |
+           p_value_groupControl_relative_month_c < 0.05 |
+           p_value_groupControl_relative_month_c2 < 0.05)
+
+variables_pathways     <- pathways_lmm_results     %>% filter(EC_specific) %>% pull(variable)
+
+cat("Pathways EC-specific:    ", length(variables_pathways), "\n")
+```
+
+
+```{r}
+metabolites_lmm_results <- metabolites_lmm_results %>%
+  mutate(EC_specific = p_value_groupControl < 0.05 |
+           p_value_groupControl_relative_month_c < 0.05 |
+           p_value_groupControl_relative_month_c2 < 0.05)
+
+variables_metabolites <- metabolites_lmm_results %>% filter(EC_specific) %>% pull(variable)
+
+cat("Metabolitos EC-specific: ", length(variables_metabolites), "\n")
+```
+
+
+# Guardado de resultados
+
+```{r}
+saveRDS(species_lmm_results,     file.path(processed_dir, "species_lmm_results.rds"))
+saveRDS(pathways_lmm_results,    file.path(processed_dir, "pathways_lmm_results.rds"))
+saveRDS(metabolites_lmm_results, file.path(processed_dir, "metabolites_lmm_results.rds"))
+```
+
+
+
+

@@ -1,0 +1,2070 @@
+---
+title: "Análisis de Componentes Principales (PCA) — Leonard et al. (2021)"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+date: "2026-06-29"
+---
+
+Este script realiza el análisis exploratorio de las tres matrices ómicas mediante PCA. 
+
+# 1. Carga de librerías
+
+```{r}
+library(tidyverse)
+library(PLSandO)
+library(gridExtra)
+library(knitr)
+library(here)
+library(ggplot2)
+```
+
+# 2. Carga de datos preprocesados
+
+```{r}
+processed_dir <- here("data", "processed", "leonard_2021")
+
+species_clr_data     <- readRDS(file.path(processed_dir, "species_clr_data.rds"))
+pathways_clr_data    <- readRDS(file.path(processed_dir, "pathways_clr_data.rds"))
+metabolites_log_data <- readRDS(file.path(processed_dir, "metabolites_log_data.rds"))
+
+dim(species_clr_data)
+dim(pathways_clr_data)
+dim(metabolites_log_data)
+```
+```{r}
+top_loadings_pc <- function(modelo_pca, componente, n = 15) {
+  
+  tibble(
+    PC = paste0("PC", componente),
+    variable = rownames(modelo_pca$loadings),
+    loading = modelo_pca$loadings[, componente]
+  ) %>%
+    mutate(
+      abs_loading = abs(loading)
+    ) %>%
+    arrange(desc(abs_loading)) %>%
+    slice_head(n = n)
+}
+```
+
+# 3. Separación de metadatos y matrices numéricas
+
+Para el PCA se necesita únicamente la matriz numérica. Se separan los metadatos (que se usarán para colorear los plots) de las variables ómicas. Se asignan los identificadores de muestra como nombres de fila para que los plots de scores puedan identificarlas si fuera necesario.
+
+```{r}
+metadata_cols <- c(
+  "sample_id", "PaperID", "group", "pair_id",
+  "time_label", "TimePoint", "relative_time_label",
+  "sample_month", "onset_month", "relative_month",
+  "Country", "Gender", "Delivery_Mode", "Genetic_Risk"
+)
+
+species_meta <- species_clr_data %>% select(any_of(metadata_cols))
+species_X    <- species_clr_data %>%
+  select(-any_of(metadata_cols)) %>%
+  mutate(across(everything(), as.numeric)) %>%
+  as.data.frame()
+rownames(species_X) <- species_meta$sample_id
+
+pathways_meta <- pathways_clr_data %>% select(any_of(metadata_cols))
+pathways_X    <- pathways_clr_data %>%
+  select(-any_of(metadata_cols)) %>%
+  mutate(across(everything(), as.numeric)) %>%
+  as.data.frame()
+rownames(pathways_X) <- pathways_meta$sample_id
+
+metabolites_meta <- metabolites_log_data %>% select(any_of(metadata_cols))
+metabolites_X    <- metabolites_log_data %>%
+  select(-any_of(metadata_cols)) %>%
+  mutate(across(everything(), as.numeric)) %>%
+  as.data.frame()
+rownames(metabolites_X) <- metabolites_meta$sample_id
+```
+
+
+
+
+# Nota sobre el escalado empleado
+
+Para cada matriz ómica (species, pathways, metabolites) se presenta primero el PCA con escalado `center` (solo centrado, sin dividir por la desviación típica de cada variable) y a continuación con escalado `standard` (centrado + escalado a varianza unitaria). 
+
+# 4. PCA — Species
+
+## 4.1 Escalado: center
+
+
+### 4.1.1 Cálculo y scree plot
+
+Se calcula el PCA sobre la matriz de especies con escalado center (solo centrado, sin dividir por la desviación típica). El scree plot muestra la varianza explicada por cada componente principal, lo que ayuda a decidir cuántas componentes son informativas.
+
+```{r}
+species_pca_center <- pca(
+  species_X,
+  ncomp   = NULL,
+  algo    = "nipals",
+  scaling = "center"
+)
+
+pcaPlot(species_pca_center, type = "scree") +
+  ggtitle("Especies — Varianza explicada por componente (centrado)")
+```
+
+### 4.1.2 Score plots — coloreando por covariables de interés
+
+#### Grupo (caso/control)
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(species_pca_center, type = "scores", comp = 1:2,
+              colBy = data.frame(Group = species_meta$group),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Species — Scores PC1-PC2 por grupo (caso/control) (escalado centrado)")
+p2 <- pcaPlot(species_pca_center, type = "scores", comp = 3:4,
+              colBy = data.frame(Group = species_meta$group),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Species — Scores PC3-PC4 por grupo (caso/control) (escalado centrado)")
+p3 <- pcaPlot(species_pca_center, type = "scores", comp = 5:6,
+              colBy = data.frame(Group = species_meta$group),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Species — Scores PC5-PC6 por grupo (caso/control) (escalado centrado)")
+
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+#### Tiempo relativo al diagnóstico
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+species_time <- factor(species_meta$relative_month,
+                       levels = c(-18, -15, -12, -9, -6, -3, 0))
+
+p1 <- pcaPlot(species_pca_center, type = "scores", comp = 1:2,
+              colBy = data.frame(relative_month = species_time),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Species — Scores PC1-PC2 por tiempo relativo al diagnóstico (escalado centrado)")
+p2 <- pcaPlot(species_pca_center, type = "scores", comp = 3:4,
+              colBy = data.frame(relative_month = species_time),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Species — Scores PC3-PC4 por tiempo relativo al diagnóstico (escalado centrado)")
+p3 <- pcaPlot(species_pca_center, type = "scores", comp = 5:6,
+              colBy = data.frame(relative_month = species_time),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Species — Scores PC5-PC6 por tiempo relativo al diagnóstico (escalado centrado)")
+
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+#### País
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(species_pca_center, type = "scores", comp = 1:2,
+              colBy = data.frame(Country = species_meta$Country),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Species — Scores PC1-PC2 por país (escalado centrado)")
+p2 <- pcaPlot(species_pca_center, type = "scores", comp = 3:4,
+              colBy = data.frame(Country = species_meta$Country),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Species — Scores PC3-PC4 por país (escalado centrado)")
+p3 <- pcaPlot(species_pca_center, type = "scores", comp = 5:6,
+              colBy = data.frame(Country = species_meta$Country),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Species — Scores PC5-PC6 por país (escalado centrado)")
+
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+#### Sexo
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(species_pca_center, type = "scores", comp = 1:2,
+              colBy = data.frame(Gender = species_meta$Gender),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Species — Scores PC1-PC2 por sexo (escalado centrado)")
+p2 <- pcaPlot(species_pca_center, type = "scores", comp = 3:4,
+              colBy = data.frame(Gender = species_meta$Gender),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Species — Scores PC3-PC4 por sexo (escalado centrado)")
+p3 <- pcaPlot(species_pca_center, type = "scores", comp = 5:6,
+              colBy = data.frame(Gender = species_meta$Gender),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Species — Scores PC5-PC6 por sexo (escalado centrado)")
+
+grid.arrange(p1, p2, p3, ncol = 3)
+```
+
+#### Tipo de parto
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(species_pca_center, type = "scores", comp = 1:2,
+              colBy = data.frame(Delivery_Mode = species_meta$Delivery_Mode),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Species — Scores PC1-PC2 por tipo de parto (escalado centrado)")
+p2 <- pcaPlot(species_pca_center, type = "scores", comp = 3:4,
+              colBy = data.frame(Delivery_Mode = species_meta$Delivery_Mode),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Species — Scores PC3-PC4 por tipo de parto (escalado centrado)")
+p3 <- pcaPlot(species_pca_center, type = "scores", comp = 5:6,
+              colBy = data.frame(Delivery_Mode = species_meta$Delivery_Mode),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Species — Scores PC5-PC6 por tipo de parto (escalado centrado)")
+
+grid.arrange(p1, p2, p3, ncol = 3)
+```
+
+#### Riesgo genético (HLA)
+
+Los nombres de los perfiles de riesgo genético son largos, por lo que se abrevian para mejorar la legibilidad de la leyenda. La leyenda se muestra solo en el panel central.
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+genetic_risk_short <- species_meta$Genetic_Risk %>%
+  str_replace_all("Homozygous", "Hom.") %>%
+  str_replace_all("Heterozygous", "Het.")
+
+p1 <- pcaPlot(species_pca_center, type = "scores", comp = 1:2,
+              colBy = data.frame(Genetic_Risk = genetic_risk_short),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Species — Scores PC1-PC2 por riesgo genético (HLA) (escalado centrado)") +
+  theme(legend.position = "none")
+
+p2 <- pcaPlot(species_pca_center, type = "scores", comp = 3:4,
+              colBy = data.frame(Genetic_Risk = genetic_risk_short),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Species — Scores PC3-PC4 por riesgo genético (HLA) (escalado centrado)") +
+  theme(legend.position = "bottom",
+        legend.text  = element_text(size = 7),
+        legend.title = element_text(size = 8))
+
+p3 <- pcaPlot(species_pca_center, type = "scores", comp = 5:6,
+              colBy = data.frame(Genetic_Risk = genetic_risk_short),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Species — Scores PC5-PC6 por riesgo genético (HLA) (escalado centrado)") +
+  theme(legend.position = "none")
+
+grid.arrange(p1, p2, p3, ncol = 3)
+```
+
+### 4.1.3 Loadings — correlation plots y top variables
+
+Los loadings indican qué especies contribuyen más a cada componente principal. El correlation plot muestra la correlación de cada variable con los ejes del PCA, coloreada por su contribución. Las tablas muestran las 10 especies con mayor contribución a cada par de componentes, lo que permite interpretar qué está impulsando la variabilidad capturada.
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+l1 <- pcaPlot(species_pca_center, type = "corr", comp = 1:2,
+              colBy = "contrib", shape = "point",
+              labels = FALSE, repel = TRUE, col = "hot") +
+  ggtitle("Species — Loadings (círculo de correlación) PC1-PC2 (escalado centrado)")
+l2 <- pcaPlot(species_pca_center, type = "corr", comp = 3:4,
+              colBy = "contrib", shape = "point",
+              labels = FALSE, repel = TRUE, col = "hot") +
+  ggtitle("Species — Loadings (círculo de correlación) PC3-PC4 (escalado centrado)")
+l3 <- pcaPlot(species_pca_center, type = "corr", comp = 5:6,
+              colBy = "contrib", shape = "point",
+              labels = FALSE, repel = TRUE, col = "hot") +
+  ggtitle("Species — Loadings (círculo de correlación) PC5-PC6 (escalado centrado)")
+
+grid.arrange(l1, l2, l3, ncol = 3)
+```
+
+**Top 10 especies — PC1 y PC2**
+
+```{r}
+species_top_PC12_center <- tibble(
+  variable    = rownames(species_pca_center$loadings),
+  loading_PC1 = species_pca_center$loadings[, 1],
+  loading_PC2 = species_pca_center$loadings[, 2]
+) %>%
+  mutate(contribution_PC12 = loading_PC1^2 + loading_PC2^2) %>%
+  arrange(desc(contribution_PC12)) %>%
+  slice_head(n = 10)
+
+kable(species_top_PC12_center)
+```
+
+**Top 10 especies — PC3 y PC4**
+
+```{r}
+species_top_PC34_center <- tibble(
+  variable    = rownames(species_pca_center$loadings),
+  loading_PC3 = species_pca_center$loadings[, 3],
+  loading_PC4 = species_pca_center$loadings[, 4]
+) %>%
+  mutate(contribution_PC34 = loading_PC3^2 + loading_PC4^2) %>%
+  arrange(desc(contribution_PC34)) %>%
+  slice_head(n = 10)
+
+kable(species_top_PC34_center)
+```
+
+**Top 10 especies — PC5 y PC6**
+
+```{r}
+species_top_PC56_center <- tibble(
+  variable    = rownames(species_pca_center$loadings),
+  loading_PC5 = species_pca_center$loadings[, 5],
+  loading_PC6 = species_pca_center$loadings[, 6]
+) %>%
+  mutate(contribution_PC56 = loading_PC5^2 + loading_PC6^2) %>%
+  arrange(desc(contribution_PC56)) %>%
+  slice_head(n = 10)
+
+kable(species_top_PC56_center)
+```
+
+
+Fijamos el número de componentes antes de estudiar los anómalos para evitar problemas con los gráficos.
+
+```{r}
+species_pca_center <- pca(
+  species_X,
+  ncomp   = 6,
+  algo    = "nipals",
+  scaling = "center"
+)
+
+```
+
+### 4.1.4 Detección de muestras anómalas
+
+Se detectan muestras anómalas mediante dos criterios complementarios. El RSS y el T² de Hotelling. 
+
+```{r fig.width=10, fig.height=4}
+par(mfrow = c(1, 2))
+
+species_out_RSS_center <- pcaOutliers(species_pca_center, ncomp = species_pca_center$ncomp,
+                               method = "RSS", conf = 0.95)
+species_out_T2_center  <- pcaOutliers(species_pca_center, ncomp = species_pca_center$ncomp,
+                               method = "T2",  conf = 0.95)
+
+par(mfrow = c(1, 1))
+```
+
+```{r}
+species_moderate_center <- sort(
+  species_out_RSS_center$RSS[species_out_RSS_center$ModerateOutliers],
+  decreasing = TRUE
+)
+
+species_severe_center <- sort(
+  species_out_T2_center$T2[species_out_T2_center$SevereOutliers],
+  decreasing = TRUE
+)
+
+cat("Anómalos moderados (RSS) al 95 :\n"); print(species_moderate_center)
+cat("\nAnómalos severos (T²) al 95 :\n");   print(species_severe_center)
+```
+
+```{r}
+par(mfrow = c(1, 2))
+
+species_out_RSS_99_center <- pcaOutliers(species_pca_center, ncomp = species_pca_center$ncomp,
+                                  method = "RSS", conf = 0.99)
+species_out_T2_99_center  <- pcaOutliers(species_pca_center, ncomp = species_pca_center$ncomp,
+                                  method = "T2",  conf = 0.99)
+
+par(mfrow = c(1, 1))
+```
+
+
+```{r}
+moderate_99_center <- sort(species_out_RSS_99_center$RSS[species_out_RSS_99_center$ModerateOutliers],
+                    decreasing = TRUE)
+severe_99_center   <- sort(species_out_T2_99_center$T2[species_out_T2_99_center$SevereOutliers],
+                    decreasing = TRUE)
+
+cat("Moderados (RSS) al 99 :\n"); print(moderate_99_center)
+cat("Severos   (T²) al 99 :\n");  print(severe_99_center)
+```
+
+```{r}
+species_contrib_99_center <- outlierContrib(species_pca_center, species_out_RSS_99_center)
+```
+
+
+```{r}
+contrib_vec_center <- species_contrib_99_center$contribRSS[1, ]
+top10_center <- contrib_vec_center[order(abs(contrib_vec_center), decreasing = TRUE)][1:10]
+top10_center
+```
+
+
+Se reproduce el mismo flujo de trbajo tanto para Pathways como para Metabolites.
+
+
+## 4.2 Escalado: standard
+
+
+### 4.2.1 Cálculo y scree plot
+
+Se calcula el PCA sobre la matriz de especies con escalado estándar. El scree plot muestra la varianza explicada por cada componente principal, lo que ayuda a decidir cuántas componentes son informativas.
+
+```{r}
+species_pca <- pca(
+  species_X,
+  ncomp   = NULL,
+  algo    = "nipals",
+  scaling = "standard"
+)
+
+pcaPlot(species_pca, type = "scree") +
+  ggtitle("Especies — Varianza explicada por componente (escalado estándar)")
+```
+
+### 4.2.2 Score plots — coloreando por covariables de interés
+
+#### Grupo (caso/control)
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(species_pca, type = "scores", comp = 1:2,
+              colBy = data.frame(Group = species_meta$group),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Species — Scores PC1-PC2 por grupo (caso/control) (escalado estándar)")
+p2 <- pcaPlot(species_pca, type = "scores", comp = 3:4,
+              colBy = data.frame(Group = species_meta$group),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Species — Scores PC3-PC4 por grupo (caso/control) (escalado estándar)")
+p3 <- pcaPlot(species_pca, type = "scores", comp = 5:6,
+              colBy = data.frame(Group = species_meta$group),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Species — Scores PC5-PC6 por grupo (caso/control) (escalado estándar)")
+
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+#### Tiempo relativo al diagnóstico
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+species_time <- factor(species_meta$relative_month,
+                       levels = c(-18, -15, -12, -9, -6, -3, 0))
+
+p1 <- pcaPlot(species_pca, type = "scores", comp = 1:2,
+              colBy = data.frame(relative_month = species_time),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Species — Scores PC1-PC2 por tiempo relativo al diagnóstico (escalado estándar)")
+p2 <- pcaPlot(species_pca, type = "scores", comp = 3:4,
+              colBy = data.frame(relative_month = species_time),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Species — Scores PC3-PC4 por tiempo relativo al diagnóstico (escalado estándar)")
+p3 <- pcaPlot(species_pca, type = "scores", comp = 5:6,
+              colBy = data.frame(relative_month = species_time),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Species — Scores PC5-PC6 por tiempo relativo al diagnóstico (escalado estándar)")
+
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+#### País
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(species_pca, type = "scores", comp = 1:2,
+              colBy = data.frame(Country = species_meta$Country),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Species — Scores PC1-PC2 por país (escalado estándar)")
+p2 <- pcaPlot(species_pca, type = "scores", comp = 3:4,
+              colBy = data.frame(Country = species_meta$Country),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Species — Scores PC3-PC4 por país (escalado estándar)")
+p3 <- pcaPlot(species_pca, type = "scores", comp = 5:6,
+              colBy = data.frame(Country = species_meta$Country),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Species — Scores PC5-PC6 por país (escalado estándar)")
+
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+#### Sexo
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(species_pca, type = "scores", comp = 1:2,
+              colBy = data.frame(Gender = species_meta$Gender),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Species — Scores PC1-PC2 por sexo (escalado estándar)")
+p2 <- pcaPlot(species_pca, type = "scores", comp = 3:4,
+              colBy = data.frame(Gender = species_meta$Gender),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Species — Scores PC3-PC4 por sexo (escalado estándar)")
+p3 <- pcaPlot(species_pca, type = "scores", comp = 5:6,
+              colBy = data.frame(Gender = species_meta$Gender),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Species — Scores PC5-PC6 por sexo (escalado estándar)")
+
+grid.arrange(p1, p2, p3, ncol = 3)
+```
+
+#### Tipo de parto
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(species_pca, type = "scores", comp = 1:2,
+              colBy = data.frame(Delivery_Mode = species_meta$Delivery_Mode),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Species — Scores PC1-PC2 por tipo de parto (escalado estándar)")
+p2 <- pcaPlot(species_pca, type = "scores", comp = 3:4,
+              colBy = data.frame(Delivery_Mode = species_meta$Delivery_Mode),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Species — Scores PC3-PC4 por tipo de parto (escalado estándar)")
+p3 <- pcaPlot(species_pca, type = "scores", comp = 5:6,
+              colBy = data.frame(Delivery_Mode = species_meta$Delivery_Mode),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Species — Scores PC5-PC6 por tipo de parto (escalado estándar)")
+
+grid.arrange(p1, p2, p3, ncol = 3)
+```
+
+#### Riesgo genético (HLA)
+
+Los nombres de los perfiles de riesgo genético son largos, por lo que se abrevian para mejorar la legibilidad de la leyenda. La leyenda se muestra solo en el panel central.
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+genetic_risk_short <- species_meta$Genetic_Risk %>%
+  str_replace_all("Homozygous", "Hom.") %>%
+  str_replace_all("Heterozygous", "Het.")
+
+p1 <- pcaPlot(species_pca, type = "scores", comp = 1:2,
+              colBy = data.frame(Genetic_Risk = genetic_risk_short),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Species — Scores PC1-PC2 por riesgo genético (HLA) (escalado estándar)") +
+  theme(legend.position = "none")
+
+p2 <- pcaPlot(species_pca, type = "scores", comp = 3:4,
+              colBy = data.frame(Genetic_Risk = genetic_risk_short),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Species — Scores PC3-PC4 por riesgo genético (HLA) (escalado estándar)") +
+  theme(legend.position = "bottom",
+        legend.text  = element_text(size = 7),
+        legend.title = element_text(size = 8))
+
+p3 <- pcaPlot(species_pca, type = "scores", comp = 5:6,
+              colBy = data.frame(Genetic_Risk = genetic_risk_short),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Species — Scores PC5-PC6 por riesgo genético (HLA) (escalado estándar)") +
+  theme(legend.position = "none")
+
+grid.arrange(p1, p2, p3, ncol = 3)
+```
+
+### 4.2.3 Loadings — correlation plots y top variables
+
+Los loadings indican qué especies contribuyen más a cada componente principal. El correlation plot muestra la correlación de cada variable con los ejes del PCA, coloreada por su contribución. Las tablas muestran las 10 especies con mayor contribución a cada par de componentes, lo que permite interpretar qué está impulsando la variabilidad capturada.
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+l1 <- pcaPlot(species_pca, type = "corr", comp = 1:2,
+              colBy = "contrib", shape = "point",
+              labels = FALSE, repel = TRUE, col = "hot") +
+  ggtitle("Species — Loadings (círculo de correlación) PC1-PC2 (escalado estándar)")
+l2 <- pcaPlot(species_pca, type = "corr", comp = 3:4,
+              colBy = "contrib", shape = "point",
+              labels = FALSE, repel = TRUE, col = "hot") +
+  ggtitle("Species — Loadings (círculo de correlación) PC3-PC4 (escalado estándar)")
+l3 <- pcaPlot(species_pca, type = "corr", comp = 5:6,
+              colBy = "contrib", shape = "point",
+              labels = FALSE, repel = TRUE, col = "hot") +
+  ggtitle("Species — Loadings (círculo de correlación) PC5-PC6 (escalado estándar)")
+
+grid.arrange(l1, l2, l3, ncol = 3)
+```
+
+**Top 10 especies — PC1 y PC2**
+
+```{r}
+species_top_PC12 <- tibble(
+  variable    = rownames(species_pca$loadings),
+  loading_PC1 = species_pca$loadings[, 1],
+  loading_PC2 = species_pca$loadings[, 2]
+) %>%
+  mutate(contribution_PC12 = loading_PC1^2 + loading_PC2^2) %>%
+  arrange(desc(contribution_PC12)) %>%
+  slice_head(n = 10)
+
+kable(species_top_PC12)
+```
+
+**Top 10 especies — PC3 y PC4**
+
+```{r}
+species_top_PC34 <- tibble(
+  variable    = rownames(species_pca$loadings),
+  loading_PC3 = species_pca$loadings[, 3],
+  loading_PC4 = species_pca$loadings[, 4]
+) %>%
+  mutate(contribution_PC34 = loading_PC3^2 + loading_PC4^2) %>%
+  arrange(desc(contribution_PC34)) %>%
+  slice_head(n = 10)
+
+kable(species_top_PC34)
+```
+
+**Top 10 especies — PC5 y PC6**
+
+```{r}
+species_top_PC56 <- tibble(
+  variable    = rownames(species_pca$loadings),
+  loading_PC5 = species_pca$loadings[, 5],
+  loading_PC6 = species_pca$loadings[, 6]
+) %>%
+  mutate(contribution_PC56 = loading_PC5^2 + loading_PC6^2) %>%
+  arrange(desc(contribution_PC56)) %>%
+  slice_head(n = 10)
+
+kable(species_top_PC56)
+```
+
+
+```{r}
+species_top_PC1 <- top_loadings_pc(
+  modelo_pca = species_pca,
+  componente = 1,
+  n = 10
+)
+
+species_top_PC2 <- top_loadings_pc(
+  modelo_pca = species_pca,
+  componente = 2,
+  n = 10
+)
+
+species_top_PC3 <- top_loadings_pc(
+  modelo_pca = species_pca,
+  componente = 3,
+  n = 10
+)
+
+species_top_PC4 <- top_loadings_pc(
+  modelo_pca = species_pca,
+  componente = 4,
+  n = 10
+)
+
+species_top_PC5 <- top_loadings_pc(
+  modelo_pca = species_pca,
+  componente = 5,
+  n = 10
+)
+
+species_top_PC6 <- top_loadings_pc(
+  modelo_pca = species_pca,
+  componente = 6,
+  n = 10
+)
+```
+
+
+```{r}
+species_top_PC1
+```
+
+```{r}
+species_top_PC2
+```
+
+```{r}
+species_top_PC3
+```
+
+```{r}
+species_top_PC4
+```
+
+```{r}
+species_top_PC5
+```
+
+```{r}
+species_top_PC6
+```
+
+Fijamos el número de componentes antes de estudiar los anómalos para evitar problemas con los gráficos.
+
+```{r}
+species_pca <- pca(
+  species_X,
+  ncomp   = 6,
+  algo    = "nipals",
+  scaling = "standard"
+)
+
+```
+
+### 4.2.4 Detección de muestras anómalas
+
+Se detectan muestras anómalas mediante dos criterios complementarios. El RSS y el T² de Hotelling. 
+
+```{r fig.width=10, fig.height=4}
+par(mfrow = c(1, 2))
+
+species_out_RSS <- pcaOutliers(species_pca, ncomp = species_pca$ncomp,
+                               method = "RSS", conf = 0.95)
+species_out_T2  <- pcaOutliers(species_pca, ncomp = species_pca$ncomp,
+                               method = "T2",  conf = 0.95)
+
+par(mfrow = c(1, 1))
+```
+
+```{r}
+species_moderate <- sort(
+  species_out_RSS$RSS[species_out_RSS$ModerateOutliers],
+  decreasing = TRUE
+)
+
+species_severe <- sort(
+  species_out_T2$T2[species_out_T2$SevereOutliers],
+  decreasing = TRUE
+)
+
+cat("Anómalos moderados (RSS) al 95 :\n"); print(species_moderate)
+cat("\nAnómalos severos (T²) al 95 :\n");   print(species_severe)
+```
+
+```{r}
+par(mfrow = c(1, 2))
+
+species_out_RSS_99 <- pcaOutliers(species_pca, ncomp = species_pca$ncomp,
+                                  method = "RSS", conf = 0.99)
+species_out_T2_99  <- pcaOutliers(species_pca, ncomp = species_pca$ncomp,
+                                  method = "T2",  conf = 0.99)
+
+par(mfrow = c(1, 1))
+```
+
+
+```{r}
+moderate_99 <- sort(species_out_RSS_99$RSS[species_out_RSS_99$ModerateOutliers],
+                    decreasing = TRUE)
+severe_99   <- sort(species_out_T2_99$T2[species_out_T2_99$SevereOutliers],
+                    decreasing = TRUE)
+
+cat("Moderados (RSS) al 99 :\n"); print(moderate_99)
+cat("Severos   (T²) al 99 :\n");  print(severe_99)
+```
+
+```{r}
+species_contrib_99 <- outlierContrib(species_pca, species_out_RSS_99)
+```
+
+
+```{r}
+contrib_vec <- species_contrib_99$contribRSS[1, ]
+top10 <- contrib_vec[order(abs(contrib_vec), decreasing = TRUE)][1:10]
+top10
+```
+
+
+Se reproduce el mismo flujo de trbajo tanto para Pathways como para Metabolites.
+
+
+# 5. PCA — Pathways
+
+## 5.1 Escalado: center
+
+
+### 5.1.1 Cálculo y scree plot
+
+```{r}
+pathways_pca_center <- pca(
+  pathways_X,
+  ncomp   = NULL,
+  algo    = "nipals",
+  scaling = "center"
+)
+
+pcaPlot(pathways_pca_center, type = "scree") +
+  ggtitle("Rutas — Varianza explicada por componente (centrado)")
+```
+
+### 5.1.2 Score plots — coloreando por covariables de interés
+
+#### Grupo (caso/control)
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(pathways_pca_center, type = "scores", comp = 1:2,
+              colBy = data.frame(Group = pathways_meta$group),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Pathways — Scores PC1-PC2 por grupo (caso/control) (escalado centrado)")
+p2 <- pcaPlot(pathways_pca_center, type = "scores", comp = 3:4,
+              colBy = data.frame(Group = pathways_meta$group),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Pathways — Scores PC3-PC4 por grupo (caso/control) (escalado centrado)")
+p3 <- pcaPlot(pathways_pca_center, type = "scores", comp = 5:6,
+              colBy = data.frame(Group = pathways_meta$group),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Pathways — Scores PC5-PC6 por grupo (caso/control) (escalado centrado)")
+
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+#### Tiempo relativo al diagnóstico
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+pathways_time <- factor(pathways_meta$relative_month,
+                        levels = c(-18, -15, -12, -9, -6, -3, 0))
+
+p1 <- pcaPlot(pathways_pca_center, type = "scores", comp = 1:2,
+              colBy = data.frame(relative_month = pathways_time),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Pathways — Scores PC1-PC2 por tiempo relativo al diagnóstico (escalado centrado)")
+p2 <- pcaPlot(pathways_pca_center, type = "scores", comp = 3:4,
+              colBy = data.frame(relative_month = pathways_time),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Pathways — Scores PC3-PC4 por tiempo relativo al diagnóstico (escalado centrado)")
+p3 <- pcaPlot(pathways_pca_center, type = "scores", comp = 5:6,
+              colBy = data.frame(relative_month = pathways_time),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Pathways — Scores PC5-PC6 por tiempo relativo al diagnóstico (escalado centrado)")
+
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+#### País
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(pathways_pca_center, type = "scores", comp = 1:2,
+              colBy = data.frame(Country = pathways_meta$Country),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Pathways — Scores PC1-PC2 por país (escalado centrado)")
+p2 <- pcaPlot(pathways_pca_center, type = "scores", comp = 3:4,
+              colBy = data.frame(Country = pathways_meta$Country),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Pathways — Scores PC3-PC4 por país (escalado centrado)")
+p3 <- pcaPlot(pathways_pca_center, type = "scores", comp = 5:6,
+              colBy = data.frame(Country = pathways_meta$Country),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Pathways — Scores PC5-PC6 por país (escalado centrado)")
+
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+#### Sexo
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(pathways_pca_center, type = "scores", comp = 1:2,
+              colBy = data.frame(Gender = pathways_meta$Gender),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Pathways — Scores PC1-PC2 por sexo (escalado centrado)")
+p2 <- pcaPlot(pathways_pca_center, type = "scores", comp = 3:4,
+              colBy = data.frame(Gender = pathways_meta$Gender),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Pathways — Scores PC3-PC4 por sexo (escalado centrado)")
+p3 <- pcaPlot(pathways_pca_center, type = "scores", comp = 5:6,
+              colBy = data.frame(Gender = pathways_meta$Gender),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Pathways — Scores PC5-PC6 por sexo (escalado centrado)")
+
+grid.arrange(p1, p2, p3, ncol = 3)
+```
+
+#### Tipo de parto
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(pathways_pca_center, type = "scores", comp = 1:2,
+              colBy = data.frame(Delivery_Mode = pathways_meta$Delivery_Mode),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Pathways — Scores PC1-PC2 por tipo de parto (escalado centrado)")
+p2 <- pcaPlot(pathways_pca_center, type = "scores", comp = 3:4,
+              colBy = data.frame(Delivery_Mode = pathways_meta$Delivery_Mode),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Pathways — Scores PC3-PC4 por tipo de parto (escalado centrado)")
+p3 <- pcaPlot(pathways_pca_center, type = "scores", comp = 5:6,
+              colBy = data.frame(Delivery_Mode = pathways_meta$Delivery_Mode),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Pathways — Scores PC5-PC6 por tipo de parto (escalado centrado)")
+
+grid.arrange(p1, p2, p3, ncol = 3)
+```
+
+#### Riesgo genético (HLA)
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+genetic_risk_short <- pathways_meta$Genetic_Risk %>%
+  str_replace_all("Homozygous", "Hom.") %>%
+  str_replace_all("Heterozygous", "Het.")
+
+p1 <- pcaPlot(pathways_pca_center, type = "scores", comp = 1:2,
+              colBy = data.frame(Genetic_Risk = genetic_risk_short),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Pathways — Scores PC1-PC2 por riesgo genético (HLA) (escalado centrado)") +
+  theme(legend.position = "none")
+
+p2 <- pcaPlot(pathways_pca_center, type = "scores", comp = 3:4,
+              colBy = data.frame(Genetic_Risk = genetic_risk_short),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Pathways — Scores PC3-PC4 por riesgo genético (HLA) (escalado centrado)") +
+  theme(legend.position = "bottom",
+        legend.text  = element_text(size = 7),
+        legend.title = element_text(size = 8))
+
+p3 <- pcaPlot(pathways_pca_center, type = "scores", comp = 5:6,
+              colBy = data.frame(Genetic_Risk = genetic_risk_short),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Pathways — Scores PC5-PC6 por riesgo genético (HLA) (escalado centrado)") +
+  theme(legend.position = "none")
+
+grid.arrange(p1, p2, p3, ncol = 3)
+```
+
+### 5.1.3 Loadings — correlation plots y top variables
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+l1 <- pcaPlot(pathways_pca_center, type = "corr", comp = 1:2,
+              colBy = "contrib", shape = "point",
+              labels = FALSE, repel = TRUE, col = "hot") +
+  ggtitle("Pathways — Loadings (círculo de correlación) PC1-PC2 (escalado centrado)")
+l2 <- pcaPlot(pathways_pca_center, type = "corr", comp = 3:4,
+              colBy = "contrib", shape = "point",
+              labels = FALSE, repel = TRUE, col = "hot") +
+  ggtitle("Pathways — Loadings (círculo de correlación) PC3-PC4 (escalado centrado)")
+l3 <- pcaPlot(pathways_pca_center, type = "corr", comp = 5:6,
+              colBy = "contrib", shape = "point",
+              labels = FALSE, repel = TRUE, col = "hot") +
+  ggtitle("Pathways — Loadings (círculo de correlación) PC5-PC6 (escalado centrado)")
+
+grid.arrange(l1, l2, l3, ncol = 3)
+```
+
+**Top 10 pathways — PC1 y PC2**
+
+```{r}
+pathways_top_PC12_center <- tibble(
+  variable    = rownames(pathways_pca_center$loadings),
+  loading_PC1 = pathways_pca_center$loadings[, 1],
+  loading_PC2 = pathways_pca_center$loadings[, 2]
+) %>%
+  mutate(contribution_PC12 = loading_PC1^2 + loading_PC2^2) %>%
+  arrange(desc(contribution_PC12)) %>%
+  slice_head(n = 10)
+
+kable(pathways_top_PC12_center)
+```
+
+**Top 10 pathways — PC3 y PC4**
+
+```{r}
+pathways_top_PC34_center <- tibble(
+  variable    = rownames(pathways_pca_center$loadings),
+  loading_PC3 = pathways_pca_center$loadings[, 3],
+  loading_PC4 = pathways_pca_center$loadings[, 4]
+) %>%
+  mutate(contribution_PC34 = loading_PC3^2 + loading_PC4^2) %>%
+  arrange(desc(contribution_PC34)) %>%
+  slice_head(n = 10)
+
+kable(pathways_top_PC34_center)
+```
+
+**Top 10 pathways — PC5 y PC6**
+
+```{r}
+pathways_top_PC56_center <- tibble(
+  variable    = rownames(pathways_pca_center$loadings),
+  loading_PC5 = pathways_pca_center$loadings[, 5],
+  loading_PC6 = pathways_pca_center$loadings[, 6]
+) %>%
+  mutate(contribution_PC56 = loading_PC5^2 + loading_PC6^2) %>%
+  arrange(desc(contribution_PC56)) %>%
+  slice_head(n = 10)
+
+kable(pathways_top_PC56_center)
+```
+
+
+Fijamos el número de componentes antes de estudiar los anómalos para evitar problemas con los gráficos.
+
+```{r}
+pathways_pca_center <- pca(
+  pathways_X,
+  ncomp   = 4,
+  algo    = "nipals",
+  scaling = "center"
+)
+```
+
+### 5.1.4 Detección de muestras anómalas
+
+```{r fig.width=10, fig.height=4}
+par(mfrow = c(1, 2))
+
+pathways_out_RSS_center <- pcaOutliers(pathways_pca_center, ncomp = pathways_pca_center$ncomp,
+                               method = "RSS", conf = 0.95)
+pathways_out_T2_center  <- pcaOutliers(pathways_pca_center, ncomp = pathways_pca_center$ncomp,
+                               method = "T2",  conf = 0.95)
+
+par(mfrow = c(1, 1))
+```
+
+```{r}
+pathways_moderate_center <- sort(
+  pathways_out_RSS_center$RSS[pathways_out_RSS_center$ModerateOutliers],
+  decreasing = TRUE
+)
+
+pathways_severe_center <- sort(
+  pathways_out_T2_center$T2[pathways_out_T2_center$SevereOutliers],
+  decreasing = TRUE
+)
+
+cat("Anómalos moderados (RSS) al 95 :\n"); print(pathways_moderate_center)
+cat("\nAnómalos severos (T²) al 95 :\n");   print(pathways_severe_center)
+```
+
+```{r}
+par(mfrow = c(1, 2))
+
+pathways_out_RSS_99_center <- pcaOutliers(pathways_pca_center, ncomp = pathways_pca_center$ncomp,method = "RSS", conf = 0.99)
+
+pathways_out_T2_99_center  <- pcaOutliers(pathways_pca_center, ncomp = pathways_pca_center$ncomp,method = "T2",  conf = 0.99)
+
+par(mfrow = c(1, 1))
+```
+
+
+```{r}
+pathways_moderate_99_center <- sort(pathways_out_RSS_99_center$RSS[pathways_out_RSS_99_center$ModerateOutliers],
+                    decreasing = TRUE)
+pathways_severe_99_center   <- sort(pathways_out_T2_99_center$T2[pathways_out_T2_99_center$SevereOutliers],
+                    decreasing = TRUE)
+
+cat("Moderados (RSS) al 99 :\n"); print(pathways_moderate_99_center)
+cat("Severos   (T²) al 99 :\n");  print(pathways_severe_99_center)
+```
+
+```{r}
+pathways_contrib_RSS_99_center <- outlierContrib(pathways_pca_center, pathways_out_RSS_99_center)
+```
+
+
+```{r}
+pathways_contrib_T2_99_center  <- outlierContrib(pathways_pca_center, pathways_out_T2_99_center)
+```
+
+
+Definimos una función reutilizable que extrae, para cada muestra anómala, las n variables con mayor contribución en valor absoluto (conservando el signo), y devuelve una lista con una tabla por muestra
+
+```{r}
+get_top_contrib_list <- function(contrib_matrix, n = 10) {
+  lapply(rownames(contrib_matrix), function(sample_name) {
+    row <- contrib_matrix[sample_name, ]
+    top <- row[order(abs(row), decreasing = TRUE)][1:n]
+    tibble(
+      sample_id    = sample_name,
+      pathway      = names(top),
+      contribution = as.numeric(top)
+    )
+  })
+}
+
+top10_moderate_center <- get_top_contrib_list(pathways_contrib_RSS_99_center$contribRSS)
+
+
+top10_moderate_center
+```
+
+
+```{r}
+top10_severe_center   <- get_top_contrib_list(pathways_contrib_T2_99_center$contribT2)
+
+top10_severe_center
+```
+
+
+## 5.2 Escalado: standard
+
+
+### 5.2.1 Cálculo y scree plot
+
+```{r}
+pathways_pca <- pca(
+  pathways_X,
+  ncomp   = NULL,
+  algo    = "nipals",
+  scaling = "standard"
+)
+
+pcaPlot(pathways_pca, type = "scree") +
+  ggtitle("Rutas — Varianza explicada por componente (escalado estándar)")
+```
+
+### 5.2.2 Score plots — coloreando por covariables de interés
+
+#### Grupo (caso/control)
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(pathways_pca, type = "scores", comp = 1:2,
+              colBy = data.frame(Group = pathways_meta$group),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Pathways — Scores PC1-PC2 por grupo (caso/control) (escalado estándar)")
+p2 <- pcaPlot(pathways_pca, type = "scores", comp = 3:4,
+              colBy = data.frame(Group = pathways_meta$group),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Pathways — Scores PC3-PC4 por grupo (caso/control) (escalado estándar)")
+p3 <- pcaPlot(pathways_pca, type = "scores", comp = 5:6,
+              colBy = data.frame(Group = pathways_meta$group),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Pathways — Scores PC5-PC6 por grupo (caso/control) (escalado estándar)")
+
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+#### Tiempo relativo al diagnóstico
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+pathways_time <- factor(pathways_meta$relative_month,
+                        levels = c(-18, -15, -12, -9, -6, -3, 0))
+
+p1 <- pcaPlot(pathways_pca, type = "scores", comp = 1:2,
+              colBy = data.frame(relative_month = pathways_time),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Pathways — Scores PC1-PC2 por tiempo relativo al diagnóstico (escalado estándar)")
+p2 <- pcaPlot(pathways_pca, type = "scores", comp = 3:4,
+              colBy = data.frame(relative_month = pathways_time),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Pathways — Scores PC3-PC4 por tiempo relativo al diagnóstico (escalado estándar)")
+p3 <- pcaPlot(pathways_pca, type = "scores", comp = 5:6,
+              colBy = data.frame(relative_month = pathways_time),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Pathways — Scores PC5-PC6 por tiempo relativo al diagnóstico (escalado estándar)")
+
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+#### País
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(pathways_pca, type = "scores", comp = 1:2,
+              colBy = data.frame(Country = pathways_meta$Country),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Pathways — Scores PC1-PC2 por país (escalado estándar)")
+p2 <- pcaPlot(pathways_pca, type = "scores", comp = 3:4,
+              colBy = data.frame(Country = pathways_meta$Country),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Pathways — Scores PC3-PC4 por país (escalado estándar)")
+p3 <- pcaPlot(pathways_pca, type = "scores", comp = 5:6,
+              colBy = data.frame(Country = pathways_meta$Country),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Pathways — Scores PC5-PC6 por país (escalado estándar)")
+
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+#### Sexo
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(pathways_pca, type = "scores", comp = 1:2,
+              colBy = data.frame(Gender = pathways_meta$Gender),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Pathways — Scores PC1-PC2 por sexo (escalado estándar)")
+p2 <- pcaPlot(pathways_pca, type = "scores", comp = 3:4,
+              colBy = data.frame(Gender = pathways_meta$Gender),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Pathways — Scores PC3-PC4 por sexo (escalado estándar)")
+p3 <- pcaPlot(pathways_pca, type = "scores", comp = 5:6,
+              colBy = data.frame(Gender = pathways_meta$Gender),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Pathways — Scores PC5-PC6 por sexo (escalado estándar)")
+
+grid.arrange(p1, p2, p3, ncol = 3)
+```
+
+#### Tipo de parto
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(pathways_pca, type = "scores", comp = 1:2,
+              colBy = data.frame(Delivery_Mode = pathways_meta$Delivery_Mode),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Pathways — Scores PC1-PC2 por tipo de parto (escalado estándar)")
+p2 <- pcaPlot(pathways_pca, type = "scores", comp = 3:4,
+              colBy = data.frame(Delivery_Mode = pathways_meta$Delivery_Mode),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Pathways — Scores PC3-PC4 por tipo de parto (escalado estándar)")
+p3 <- pcaPlot(pathways_pca, type = "scores", comp = 5:6,
+              colBy = data.frame(Delivery_Mode = pathways_meta$Delivery_Mode),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Pathways — Scores PC5-PC6 por tipo de parto (escalado estándar)")
+
+grid.arrange(p1, p2, p3, ncol = 3)
+```
+
+#### Riesgo genético (HLA)
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+genetic_risk_short <- pathways_meta$Genetic_Risk %>%
+  str_replace_all("Homozygous", "Hom.") %>%
+  str_replace_all("Heterozygous", "Het.")
+
+p1 <- pcaPlot(pathways_pca, type = "scores", comp = 1:2,
+              colBy = data.frame(Genetic_Risk = genetic_risk_short),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Pathways — Scores PC1-PC2 por riesgo genético (HLA) (escalado estándar)") +
+  theme(legend.position = "none")
+
+p2 <- pcaPlot(pathways_pca, type = "scores", comp = 3:4,
+              colBy = data.frame(Genetic_Risk = genetic_risk_short),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Pathways — Scores PC3-PC4 por riesgo genético (HLA) (escalado estándar)") +
+  theme(legend.position = "bottom",
+        legend.text  = element_text(size = 7),
+        legend.title = element_text(size = 8))
+
+p3 <- pcaPlot(pathways_pca, type = "scores", comp = 5:6,
+              colBy = data.frame(Genetic_Risk = genetic_risk_short),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Pathways — Scores PC5-PC6 por riesgo genético (HLA) (escalado estándar)") +
+  theme(legend.position = "none")
+
+grid.arrange(p1, p2, p3, ncol = 3)
+```
+
+### 5.2.3 Loadings — correlation plots y top variables
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+l1 <- pcaPlot(pathways_pca, type = "corr", comp = 1:2,
+              colBy = "contrib", shape = "point",
+              labels = FALSE, repel = TRUE, col = "hot") +
+  ggtitle("Pathways — Loadings (círculo de correlación) PC1-PC2 (escalado estándar)")
+l2 <- pcaPlot(pathways_pca, type = "corr", comp = 3:4,
+              colBy = "contrib", shape = "point",
+              labels = FALSE, repel = TRUE, col = "hot") +
+  ggtitle("Pathways — Loadings (círculo de correlación) PC3-PC4 (escalado estándar)")
+l3 <- pcaPlot(pathways_pca, type = "corr", comp = 5:6,
+              colBy = "contrib", shape = "point",
+              labels = FALSE, repel = TRUE, col = "hot") +
+  ggtitle("Pathways — Loadings (círculo de correlación) PC5-PC6 (escalado estándar)")
+
+grid.arrange(l1, l2, l3, ncol = 3)
+```
+
+**Top 10 pathways — PC1 y PC2**
+
+```{r}
+pathways_top_PC12 <- tibble(
+  variable    = rownames(pathways_pca$loadings),
+  loading_PC1 = pathways_pca$loadings[, 1],
+  loading_PC2 = pathways_pca$loadings[, 2]
+) %>%
+  mutate(contribution_PC12 = loading_PC1^2 + loading_PC2^2) %>%
+  arrange(desc(contribution_PC12)) %>%
+  slice_head(n = 10)
+
+kable(pathways_top_PC12)
+```
+
+**Top 10 pathways — PC3 y PC4**
+
+```{r}
+pathways_top_PC34 <- tibble(
+  variable    = rownames(pathways_pca$loadings),
+  loading_PC3 = pathways_pca$loadings[, 3],
+  loading_PC4 = pathways_pca$loadings[, 4]
+) %>%
+  mutate(contribution_PC34 = loading_PC3^2 + loading_PC4^2) %>%
+  arrange(desc(contribution_PC34)) %>%
+  slice_head(n = 10)
+
+kable(pathways_top_PC34)
+```
+
+**Top 10 pathways — PC5 y PC6**
+
+```{r}
+pathways_top_PC56 <- tibble(
+  variable    = rownames(pathways_pca$loadings),
+  loading_PC5 = pathways_pca$loadings[, 5],
+  loading_PC6 = pathways_pca$loadings[, 6]
+) %>%
+  mutate(contribution_PC56 = loading_PC5^2 + loading_PC6^2) %>%
+  arrange(desc(contribution_PC56)) %>%
+  slice_head(n = 10)
+
+kable(pathways_top_PC56)
+```
+
+```{r}
+pathways_top_PC1 <- top_loadings_pc(
+  modelo_pca = pathways_pca,
+  componente = 1,
+  n = 10
+)
+
+pathways_top_PC2 <- top_loadings_pc(
+  modelo_pca = pathways_pca,
+  componente = 2,
+  n = 10
+)
+
+pathways_top_PC3 <- top_loadings_pc(
+  modelo_pca = pathways_pca,
+  componente = 3,
+  n = 10
+)
+
+pathways_top_PC4 <- top_loadings_pc(
+  modelo_pca = pathways_pca,
+  componente = 4,
+  n = 10
+)
+
+pathways_top_PC5 <- top_loadings_pc(
+  modelo_pca = pathways_pca,
+  componente = 5,
+  n = 10
+)
+
+pathways_top_PC6 <- top_loadings_pc(
+  modelo_pca = pathways_pca,
+  componente = 6,
+  n = 10
+)
+```
+
+
+```{r}
+pathways_top_PC1
+```
+
+```{r}
+pathways_top_PC2
+```
+
+```{r}
+pathways_top_PC3
+```
+
+```{r}
+pathways_top_PC4
+```
+
+```{r}
+pathways_top_PC5
+```
+
+```{r}
+pathways_top_PC6
+```
+
+Fijamos el número de componentes antes de estudiar los anómalos para evitar problemas con los gráficos.
+
+```{r}
+pathways_pca <- pca(
+  pathways_X,
+  ncomp   = 4,
+  algo    = "nipals",
+  scaling = "standard"
+)
+```
+
+### 5.2.4 Detección de muestras anómalas
+
+```{r fig.width=10, fig.height=4}
+par(mfrow = c(1, 2))
+
+pathways_out_RSS <- pcaOutliers(pathways_pca, ncomp = pathways_pca$ncomp,
+                               method = "RSS", conf = 0.95)
+pathways_out_T2  <- pcaOutliers(pathways_pca, ncomp = pathways_pca$ncomp,
+                               method = "T2",  conf = 0.95)
+
+par(mfrow = c(1, 1))
+```
+
+```{r}
+pathways_moderate <- sort(
+  pathways_out_RSS$RSS[pathways_out_RSS$ModerateOutliers],
+  decreasing = TRUE
+)
+
+pathways_severe <- sort(
+  pathways_out_T2$T2[pathways_out_T2$SevereOutliers],
+  decreasing = TRUE
+)
+
+cat("Anómalos moderados (RSS) al 95 :\n"); print(pathways_moderate)
+cat("\nAnómalos severos (T²) al 95 :\n");   print(pathways_severe)
+```
+
+```{r}
+par(mfrow = c(1, 2))
+
+pathways_out_RSS_99 <- pcaOutliers(pathways_pca, ncomp = pathways_pca$ncomp,method = "RSS", conf = 0.99)
+
+pathways_out_T2_99  <- pcaOutliers(pathways_pca, ncomp = pathways_pca$ncomp,method = "T2",  conf = 0.99)
+
+par(mfrow = c(1, 1))
+```
+
+
+```{r}
+pathways_moderate_99 <- sort(pathways_out_RSS_99$RSS[pathways_out_RSS_99$ModerateOutliers],
+                    decreasing = TRUE)
+pathways_severe_99   <- sort(pathways_out_T2_99$T2[pathways_out_T2_99$SevereOutliers],
+                    decreasing = TRUE)
+
+cat("Moderados (RSS) al 99 :\n"); print(pathways_moderate_99)
+cat("Severos   (T²) al 99 :\n");  print(pathways_severe_99)
+```
+
+```{r}
+pathways_contrib_RSS_99 <- outlierContrib(pathways_pca, pathways_out_RSS_99)
+```
+
+
+```{r}
+pathways_contrib_T2_99  <- outlierContrib(pathways_pca, pathways_out_T2_99)
+```
+
+
+Definimos una función reutilizable que extrae, para cada muestra anómala, las n variables con mayor contribución en valor absoluto (conservando el signo), y devuelve una lista con una tabla por muestra
+
+```{r}
+get_top_contrib_list <- function(contrib_matrix, n = 10) {
+  lapply(rownames(contrib_matrix), function(sample_name) {
+    row <- contrib_matrix[sample_name, ]
+    top <- row[order(abs(row), decreasing = TRUE)][1:n]
+    tibble(
+      sample_id    = sample_name,
+      pathway      = names(top),
+      contribution = as.numeric(top)
+    )
+  })
+}
+
+top10_moderate <- get_top_contrib_list(pathways_contrib_RSS_99$contribRSS)
+
+
+top10_moderate
+```
+
+
+```{r}
+top10_severe   <- get_top_contrib_list(pathways_contrib_T2_99$contribT2)
+
+top10_severe
+```
+
+
+# 6. PCA — Metabolites
+
+## 6.1 Escalado: center
+
+
+### 6.1.1 Cálculo y scree plot
+
+```{r}
+metabolites_pca_center <- pca(
+  metabolites_X,
+  ncomp   = NULL,
+  algo    = "nipals",
+  scaling = "center"
+)
+
+pcaPlot(metabolites_pca_center, type = "scree") +
+  ggtitle("Metabolitos — Varianza explicada por componente (centrado)")
+```
+
+### 6.1.2 Score plots — coloreando por covariables de interés
+
+#### Grupo (caso/control)
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(metabolites_pca_center, type = "scores", comp = 1:2,
+              colBy = data.frame(Group = metabolites_meta$group),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Metabolites — Scores PC1-PC2 por grupo (caso/control) (escalado centrado)")
+p2 <- pcaPlot(metabolites_pca_center, type = "scores", comp = 3:4,
+              colBy = data.frame(Group = metabolites_meta$group),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Metabolites — Scores PC3-PC4 por grupo (caso/control) (escalado centrado)")
+p3 <- pcaPlot(metabolites_pca_center, type = "scores", comp = 5:6,
+              colBy = data.frame(Group = metabolites_meta$group),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Metabolites — Scores PC5-PC6 por grupo (caso/control) (escalado centrado)")
+
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+#### Tiempo relativo al diagnóstico
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+metabolites_time <- factor(metabolites_meta$relative_month,
+                           levels = c(-18, -15, -12, -9, -6, -3, 0))
+
+p1 <- pcaPlot(metabolites_pca_center, type = "scores", comp = 1:2,
+              colBy = data.frame(relative_month = metabolites_time),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Metabolites — Scores PC1-PC2 por tiempo relativo al diagnóstico (escalado centrado)")
+p2 <- pcaPlot(metabolites_pca_center, type = "scores", comp = 3:4,
+              colBy = data.frame(relative_month = metabolites_time),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Metabolites — Scores PC3-PC4 por tiempo relativo al diagnóstico (escalado centrado)")
+p3 <- pcaPlot(metabolites_pca_center, type = "scores", comp = 5:6,
+              colBy = data.frame(relative_month = metabolites_time),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Metabolites — Scores PC5-PC6 por tiempo relativo al diagnóstico (escalado centrado)")
+
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+#### País
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(metabolites_pca_center, type = "scores", comp = 1:2,
+              colBy = data.frame(Country = metabolites_meta$Country),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Metabolites — Scores PC1-PC2 por país (escalado centrado)")
+p2 <- pcaPlot(metabolites_pca_center, type = "scores", comp = 3:4,
+              colBy = data.frame(Country = metabolites_meta$Country),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Metabolites — Scores PC3-PC4 por país (escalado centrado)")
+p3 <- pcaPlot(metabolites_pca_center, type = "scores", comp = 5:6,
+              colBy = data.frame(Country = metabolites_meta$Country),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Metabolites — Scores PC5-PC6 por país (escalado centrado)")
+
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+#### Sexo
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(metabolites_pca_center, type = "scores", comp = 1:2,
+              colBy = data.frame(Gender = metabolites_meta$Gender),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Metabolites — Scores PC1-PC2 por sexo (escalado centrado)")
+p2 <- pcaPlot(metabolites_pca_center, type = "scores", comp = 3:4,
+              colBy = data.frame(Gender = metabolites_meta$Gender),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Metabolites — Scores PC3-PC4 por sexo (escalado centrado)")
+p3 <- pcaPlot(metabolites_pca_center, type = "scores", comp = 5:6,
+              colBy = data.frame(Gender = metabolites_meta$Gender),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Metabolites — Scores PC5-PC6 por sexo (escalado centrado)")
+
+grid.arrange(p1, p2, p3, ncol = 3)
+```
+
+#### Tipo de parto
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(metabolites_pca_center, type = "scores", comp = 1:2,
+              colBy = data.frame(Delivery_Mode = metabolites_meta$Delivery_Mode),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Metabolites — Scores PC1-PC2 por tipo de parto (escalado centrado)")
+p2 <- pcaPlot(metabolites_pca_center, type = "scores", comp = 3:4,
+              colBy = data.frame(Delivery_Mode = metabolites_meta$Delivery_Mode),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Metabolites — Scores PC3-PC4 por tipo de parto (escalado centrado)")
+p3 <- pcaPlot(metabolites_pca_center, type = "scores", comp = 5:6,
+              colBy = data.frame(Delivery_Mode = metabolites_meta$Delivery_Mode),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Metabolites — Scores PC5-PC6 por tipo de parto (escalado centrado)")
+
+grid.arrange(p1, p2, p3, ncol = 3)
+```
+
+#### Riesgo genético (HLA)
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+genetic_risk_short <- metabolites_meta$Genetic_Risk %>%
+  str_replace_all("Homozygous", "Hom.") %>%
+  str_replace_all("Heterozygous", "Het.")
+
+p1 <- pcaPlot(metabolites_pca_center, type = "scores", comp = 1:2,
+              colBy = data.frame(Genetic_Risk = genetic_risk_short),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Metabolites — Scores PC1-PC2 por riesgo genético (HLA) (escalado centrado)") +
+  theme(legend.position = "none")
+
+p2 <- pcaPlot(metabolites_pca_center, type = "scores", comp = 3:4,
+              colBy = data.frame(Genetic_Risk = genetic_risk_short),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Metabolites — Scores PC3-PC4 por riesgo genético (HLA) (escalado centrado)") +
+  theme(legend.position = "bottom",
+        legend.text  = element_text(size = 7),
+        legend.title = element_text(size = 8))
+
+p3 <- pcaPlot(metabolites_pca_center, type = "scores", comp = 5:6,
+              colBy = data.frame(Genetic_Risk = genetic_risk_short),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Metabolites — Scores PC5-PC6 por riesgo genético (HLA) (escalado centrado)") +
+  theme(legend.position = "none")
+
+grid.arrange(p1, p2, p3, ncol = 3)
+```
+
+### 6.1.3 Loadings — correlation plots y top variables
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+l1 <- pcaPlot(metabolites_pca_center, type = "corr", comp = 1:2,
+              colBy = "contrib", shape = "point",
+              labels = FALSE, repel = TRUE, col = "hot") +
+  ggtitle("Metabolites — Loadings (círculo de correlación) PC1-PC2 (escalado centrado)")
+l2 <- pcaPlot(metabolites_pca_center, type = "corr", comp = 3:4,
+              colBy = "contrib", shape = "point",
+              labels = FALSE, repel = TRUE, col = "hot") +
+  ggtitle("Metabolites — Loadings (círculo de correlación) PC3-PC4 (escalado centrado)")
+l3 <- pcaPlot(metabolites_pca_center, type = "corr", comp = 5:6,
+              colBy = "contrib", shape = "point",
+              labels = FALSE, repel = TRUE, col = "hot") +
+  ggtitle("Metabolites — Loadings (círculo de correlación) PC5-PC6 (escalado centrado)")
+
+grid.arrange(l1, l2, l3, ncol = 3)
+```
+
+**Top 10 metabolitos — PC1 y PC2**
+
+```{r}
+metabolites_top_PC12_center <- tibble(
+  variable    = rownames(metabolites_pca_center$loadings),
+  loading_PC1 = metabolites_pca_center$loadings[, 1],
+  loading_PC2 = metabolites_pca_center$loadings[, 2]
+) %>%
+  mutate(contribution_PC12 = loading_PC1^2 + loading_PC2^2) %>%
+  arrange(desc(contribution_PC12)) %>%
+  slice_head(n = 10)
+
+kable(metabolites_top_PC12_center)
+```
+
+**Top 10 metabolitos — PC3 y PC4**
+
+```{r}
+metabolites_top_PC34_center <- tibble(
+  variable    = rownames(metabolites_pca_center$loadings),
+  loading_PC3 = metabolites_pca_center$loadings[, 3],
+  loading_PC4 = metabolites_pca_center$loadings[, 4]
+) %>%
+  mutate(contribution_PC34 = loading_PC3^2 + loading_PC4^2) %>%
+  arrange(desc(contribution_PC34)) %>%
+  slice_head(n = 10)
+
+kable(metabolites_top_PC34_center)
+```
+
+**Top 10 metabolitos — PC5 y PC6**
+
+```{r}
+metabolites_top_PC56_center <- tibble(
+  variable    = rownames(metabolites_pca_center$loadings),
+  loading_PC5 = metabolites_pca_center$loadings[, 5],
+  loading_PC6 = metabolites_pca_center$loadings[, 6]
+) %>%
+  mutate(contribution_PC56 = loading_PC5^2 + loading_PC6^2) %>%
+  arrange(desc(contribution_PC56)) %>%
+  slice_head(n = 10)
+
+kable(metabolites_top_PC56_center)
+```
+
+Fijamos el número de componentes antes de estudiar los anómalos para evitar problemas con los gráficos.
+
+```{r}
+metabolites_pca_center <- pca(
+  metabolites_X,
+  ncomp   = 4,
+  algo    = "nipals",
+  scaling = "center"
+)
+```
+
+
+### 6.1.4 Detección de muestras anómalas
+
+```{r fig.width=10, fig.height=4}
+par(mfrow = c(1, 2))
+
+metabolites_out_RSS_center <- pcaOutliers(metabolites_pca_center, ncomp = metabolites_pca_center$ncomp,method = "RSS", conf = 0.95)
+
+metabolites_out_T2_center  <- pcaOutliers(metabolites_pca_center, ncomp = metabolites_pca_center$ncomp,method = "T2",  conf = 0.95)
+
+par(mfrow = c(1, 1))
+```
+
+```{r}
+metabolites_moderate_center <- sort(
+  metabolites_out_RSS_center$RSS[metabolites_out_RSS_center$ModerateOutliers],
+  decreasing = TRUE
+)
+
+metabolites_severe_center <- sort(
+  metabolites_out_T2_center$T2[metabolites_out_T2_center$SevereOutliers],
+  decreasing = TRUE
+)
+
+cat("Anómalos moderados (RSS) al 95 :\n"); print(metabolites_moderate_center)
+cat("\nAnómalos severos (T²) al 95 :\n");   print(metabolites_severe_center)
+```
+
+```{r}
+par(mfrow = c(1, 2))
+
+metabolites_out_RSS_99_center <- pcaOutliers(metabolites_pca_center, ncomp = metabolites_pca_center$ncomp,method = "RSS", conf = 0.99)
+
+metabolites_out_T2_99_center  <- pcaOutliers(metabolites_pca_center, ncomp = metabolites_pca_center$ncomp,method = "T2",  conf = 0.99)
+
+par(mfrow = c(1, 1))
+```
+
+
+```{r}
+metabolites_moderate_99_center <- sort(metabolites_out_RSS_99_center$RSS[metabolites_out_RSS_99_center$ModerateOutliers],
+                    decreasing = TRUE)
+metabolites_severe_99_center   <- sort(metabolites_out_T2_99_center$T2[metabolites_out_T2_99_center$SevereOutliers],
+                    decreasing = TRUE)
+
+cat("Moderados (RSS) al 99 :\n"); print(metabolites_moderate_99_center)
+cat("Severos   (T²) al 99 :\n");  print(metabolites_severe_99_center)
+```
+
+
+```{r}
+metabolites_contrib_T2_99_center <- outlierContrib(metabolites_pca_center, metabolites_out_T2_99_center)
+```
+
+```{r}
+top10_severe_metabolites_center <- get_top_contrib_list(metabolites_contrib_T2_99_center$contribT2)
+
+top10_severe_metabolites_center
+```
+
+
+
+## 6.2 Escalado: standard
+
+
+### 6.2.1 Cálculo y scree plot
+
+```{r}
+metabolites_pca <- pca(
+  metabolites_X,
+  ncomp   = NULL,
+  algo    = "nipals",
+  scaling = "standard"
+)
+
+pcaPlot(metabolites_pca, type = "scree") +
+  ggtitle("Metabolitos — Varianza explicada por componente (escalado estándar)")
+```
+
+### 6.2.2 Score plots — coloreando por covariables de interés
+
+#### Grupo (caso/control)
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(metabolites_pca, type = "scores", comp = 1:2,
+              colBy = data.frame(Group = metabolites_meta$group),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Metabolites — Scores PC1-PC2 por grupo (caso/control) (escalado estándar)")
+p2 <- pcaPlot(metabolites_pca, type = "scores", comp = 3:4,
+              colBy = data.frame(Group = metabolites_meta$group),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Metabolites — Scores PC3-PC4 por grupo (caso/control) (escalado estándar)")
+p3 <- pcaPlot(metabolites_pca, type = "scores", comp = 5:6,
+              colBy = data.frame(Group = metabolites_meta$group),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Metabolites — Scores PC5-PC6 por grupo (caso/control) (escalado estándar)")
+
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+#### Tiempo relativo al diagnóstico
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+metabolites_time <- factor(metabolites_meta$relative_month,
+                           levels = c(-18, -15, -12, -9, -6, -3, 0))
+
+p1 <- pcaPlot(metabolites_pca, type = "scores", comp = 1:2,
+              colBy = data.frame(relative_month = metabolites_time),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Metabolites — Scores PC1-PC2 por tiempo relativo al diagnóstico (escalado estándar)")
+p2 <- pcaPlot(metabolites_pca, type = "scores", comp = 3:4,
+              colBy = data.frame(relative_month = metabolites_time),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Metabolites — Scores PC3-PC4 por tiempo relativo al diagnóstico (escalado estándar)")
+p3 <- pcaPlot(metabolites_pca, type = "scores", comp = 5:6,
+              colBy = data.frame(relative_month = metabolites_time),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Metabolites — Scores PC5-PC6 por tiempo relativo al diagnóstico (escalado estándar)")
+
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+#### País
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(metabolites_pca, type = "scores", comp = 1:2,
+              colBy = data.frame(Country = metabolites_meta$Country),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Metabolites — Scores PC1-PC2 por país (escalado estándar)")
+p2 <- pcaPlot(metabolites_pca, type = "scores", comp = 3:4,
+              colBy = data.frame(Country = metabolites_meta$Country),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Metabolites — Scores PC3-PC4 por país (escalado estándar)")
+p3 <- pcaPlot(metabolites_pca, type = "scores", comp = 5:6,
+              colBy = data.frame(Country = metabolites_meta$Country),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Metabolites — Scores PC5-PC6 por país (escalado estándar)")
+
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+#### Sexo
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(metabolites_pca, type = "scores", comp = 1:2,
+              colBy = data.frame(Gender = metabolites_meta$Gender),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Metabolites — Scores PC1-PC2 por sexo (escalado estándar)")
+p2 <- pcaPlot(metabolites_pca, type = "scores", comp = 3:4,
+              colBy = data.frame(Gender = metabolites_meta$Gender),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Metabolites — Scores PC3-PC4 por sexo (escalado estándar)")
+p3 <- pcaPlot(metabolites_pca, type = "scores", comp = 5:6,
+              colBy = data.frame(Gender = metabolites_meta$Gender),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Metabolites — Scores PC5-PC6 por sexo (escalado estándar)")
+
+grid.arrange(p1, p2, p3, ncol = 3)
+```
+
+#### Tipo de parto
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+p1 <- pcaPlot(metabolites_pca, type = "scores", comp = 1:2,
+              colBy = data.frame(Delivery_Mode = metabolites_meta$Delivery_Mode),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Metabolites — Scores PC1-PC2 por tipo de parto (escalado estándar)")
+p2 <- pcaPlot(metabolites_pca, type = "scores", comp = 3:4,
+              colBy = data.frame(Delivery_Mode = metabolites_meta$Delivery_Mode),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Metabolites — Scores PC3-PC4 por tipo de parto (escalado estándar)")
+p3 <- pcaPlot(metabolites_pca, type = "scores", comp = 5:6,
+              colBy = data.frame(Delivery_Mode = metabolites_meta$Delivery_Mode),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Metabolites — Scores PC5-PC6 por tipo de parto (escalado estándar)")
+
+grid.arrange(p1, p2, p3, ncol = 3)
+```
+
+#### Riesgo genético (HLA)
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+genetic_risk_short <- metabolites_meta$Genetic_Risk %>%
+  str_replace_all("Homozygous", "Hom.") %>%
+  str_replace_all("Heterozygous", "Het.")
+
+p1 <- pcaPlot(metabolites_pca, type = "scores", comp = 1:2,
+              colBy = data.frame(Genetic_Risk = genetic_risk_short),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Metabolites — Scores PC1-PC2 por riesgo genético (HLA) (escalado estándar)") +
+  theme(legend.position = "none")
+
+p2 <- pcaPlot(metabolites_pca, type = "scores", comp = 3:4,
+              colBy = data.frame(Genetic_Risk = genetic_risk_short),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Metabolites — Scores PC3-PC4 por riesgo genético (HLA) (escalado estándar)") +
+  theme(legend.position = "bottom",
+        legend.text  = element_text(size = 7),
+        legend.title = element_text(size = 8))
+
+p3 <- pcaPlot(metabolites_pca, type = "scores", comp = 5:6,
+              colBy = data.frame(Genetic_Risk = genetic_risk_short),
+              labels = FALSE, ellipses = FALSE) +
+  ggtitle("Metabolites — Scores PC5-PC6 por riesgo genético (HLA) (escalado estándar)") +
+  theme(legend.position = "none")
+
+grid.arrange(p1, p2, p3, ncol = 3)
+```
+
+### 6.2.3 Loadings — correlation plots y top variables
+
+```{r fig.width=14, fig.height=4, out.width="100%"}
+l1 <- pcaPlot(metabolites_pca, type = "corr", comp = 1:2,
+              colBy = "contrib", shape = "point",
+              labels = FALSE, repel = TRUE, col = "hot") +
+  ggtitle("Metabolites — Loadings (círculo de correlación) PC1-PC2 (escalado estándar)")
+l2 <- pcaPlot(metabolites_pca, type = "corr", comp = 3:4,
+              colBy = "contrib", shape = "point",
+              labels = FALSE, repel = TRUE, col = "hot") +
+  ggtitle("Metabolites — Loadings (círculo de correlación) PC3-PC4 (escalado estándar)")
+l3 <- pcaPlot(metabolites_pca, type = "corr", comp = 5:6,
+              colBy = "contrib", shape = "point",
+              labels = FALSE, repel = TRUE, col = "hot") +
+  ggtitle("Metabolites — Loadings (círculo de correlación) PC5-PC6 (escalado estándar)")
+
+grid.arrange(l1, l2, l3, ncol = 3)
+```
+
+**Top 10 metabolitos — PC1 y PC2**
+
+```{r}
+metabolites_top_PC12 <- tibble(
+  variable    = rownames(metabolites_pca$loadings),
+  loading_PC1 = metabolites_pca$loadings[, 1],
+  loading_PC2 = metabolites_pca$loadings[, 2]
+) %>%
+  mutate(contribution_PC12 = loading_PC1^2 + loading_PC2^2) %>%
+  arrange(desc(contribution_PC12)) %>%
+  slice_head(n = 10)
+
+kable(metabolites_top_PC12)
+```
+
+**Top 10 metabolitos — PC3 y PC4**
+
+```{r}
+metabolites_top_PC34 <- tibble(
+  variable    = rownames(metabolites_pca$loadings),
+  loading_PC3 = metabolites_pca$loadings[, 3],
+  loading_PC4 = metabolites_pca$loadings[, 4]
+) %>%
+  mutate(contribution_PC34 = loading_PC3^2 + loading_PC4^2) %>%
+  arrange(desc(contribution_PC34)) %>%
+  slice_head(n = 10)
+
+kable(metabolites_top_PC34)
+```
+
+**Top 10 metabolitos — PC5 y PC6**
+
+```{r}
+metabolites_top_PC56 <- tibble(
+  variable    = rownames(metabolites_pca$loadings),
+  loading_PC5 = metabolites_pca$loadings[, 5],
+  loading_PC6 = metabolites_pca$loadings[, 6]
+) %>%
+  mutate(contribution_PC56 = loading_PC5^2 + loading_PC6^2) %>%
+  arrange(desc(contribution_PC56)) %>%
+  slice_head(n = 10)
+
+kable(metabolites_top_PC56)
+```
+
+```{r}
+metabolites_top_PC1 <- top_loadings_pc(
+  modelo_pca = metabolites_pca,
+  componente = 1,
+  n = 10
+)
+
+metabolites_top_PC2 <- top_loadings_pc(
+  modelo_pca = metabolites_pca,
+  componente = 2,
+  n = 10
+)
+
+metabolites_top_PC3 <- top_loadings_pc(
+  modelo_pca = metabolites_pca,
+  componente = 3,
+  n = 10
+)
+
+metabolites_top_PC4 <- top_loadings_pc(
+  modelo_pca = metabolites_pca,
+  componente = 4,
+  n = 10
+)
+
+metabolites_top_PC5 <- top_loadings_pc(
+  modelo_pca = metabolites_pca,
+  componente = 5,
+  n = 10
+)
+
+metabolites_top_PC6 <- top_loadings_pc(
+  modelo_pca = metabolites_pca,
+  componente = 6,
+  n = 10
+)
+```
+
+
+```{r}
+metabolites_top_PC1
+```
+
+```{r}
+metabolites_top_PC2
+```
+
+```{r}
+metabolites_top_PC3
+```
+
+```{r}
+metabolites_top_PC4
+```
+
+```{r}
+metabolites_top_PC5
+```
+
+```{r}
+metabolites_top_PC6
+```
+
+Fijamos el número de componentes antes de estudiar los anómalos para evitar problemas con los gráficos.
+
+```{r}
+metabolites_pca <- pca(
+  metabolites_X,
+  ncomp   = 6,
+  algo    = "nipals",
+  scaling = "standard"
+)
+```
+
+
+### 6.2.4 Detección de muestras anómalas
+
+```{r fig.width=10, fig.height=4}
+par(mfrow = c(1, 2))
+
+metabolites_out_RSS <- pcaOutliers(metabolites_pca, ncomp = metabolites_pca$ncomp,method = "RSS", conf = 0.95)
+
+metabolites_out_T2  <- pcaOutliers(metabolites_pca, ncomp = metabolites_pca$ncomp,method = "T2",  conf = 0.95)
+
+par(mfrow = c(1, 1))
+```
+
+```{r}
+metabolites_moderate <- sort(
+  metabolites_out_RSS$RSS[metabolites_out_RSS$ModerateOutliers],
+  decreasing = TRUE
+)
+
+metabolites_severe <- sort(
+  metabolites_out_T2$T2[metabolites_out_T2$SevereOutliers],
+  decreasing = TRUE
+)
+
+cat("Anómalos moderados (RSS) al 95 :\n"); print(metabolites_moderate)
+cat("\nAnómalos severos (T²) al 95 :\n");   print(metabolites_severe)
+```
+
+```{r}
+par(mfrow = c(1, 2))
+
+metabolites_out_RSS_99 <- pcaOutliers(metabolites_pca, ncomp = metabolites_pca$ncomp,method = "RSS", conf = 0.99)
+
+metabolites_out_T2_99  <- pcaOutliers(metabolites_pca, ncomp = metabolites_pca$ncomp,method = "T2",  conf = 0.99)
+
+par(mfrow = c(1, 1))
+```
+
+
+```{r}
+metabolites_moderate_99 <- sort(metabolites_out_RSS_99$RSS[metabolites_out_RSS_99$ModerateOutliers],
+                    decreasing = TRUE)
+metabolites_severe_99   <- sort(metabolites_out_T2_99$T2[metabolites_out_T2_99$SevereOutliers],
+                    decreasing = TRUE)
+
+cat("Moderados (RSS) al 99 :\n"); print(metabolites_moderate_99)
+cat("Severos   (T²) al 99 :\n");  print(metabolites_severe_99)
+```
+
+
+```{r}
+metabolites_contrib_T2_99 <- outlierContrib(metabolites_pca, metabolites_out_T2_99)
+```
+
+```{r}
+top10_severe_metabolites <- get_top_contrib_list(metabolites_contrib_T2_99$contribT2)
+
+top10_severe_metabolites
+```
+
+
